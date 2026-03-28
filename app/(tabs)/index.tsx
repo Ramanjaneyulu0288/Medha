@@ -482,6 +482,18 @@ export default function ChatScreen() {
           </View>
         </View>
         <View style={styles.headerBadges}>
+          {isThinking && (
+            <TouchableOpacity
+              style={[styles.stopButton, { borderColor: theme.error, marginRight: 8 }]}
+              onPress={async () => {
+                if (chatContextRef.current) {
+                  await chatContextRef.current.stopCompletion();
+                }
+              }}
+            >
+              <Text style={{ color: theme.error, fontWeight: '700', fontSize: 10 }}>STOP</Text>
+            </TouchableOpacity>
+          )}
           <StatusBadge
             status={status.sqliteVec}
             label={status.sqliteVec === 'ready' ? 'Vec DB' : 'Vec !'}
@@ -737,6 +749,14 @@ const styles = StyleSheet.create({
   },
 
   // Thinking
+  stopButton: {
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 8,
+    borderWidth: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
   thinkingBar: {
     flexDirection: 'row',
     alignItems: 'center',
