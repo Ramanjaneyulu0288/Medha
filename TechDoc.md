@@ -1,18 +1,17 @@
-That document confirms you're on the right track: Nitro SQLite + sqlite-vec is the gold standard for "Medha" apps because it bypasses the slow React Native bridge.
-To make this actually work as a "learning" system, you need to bridge the gap between your data (SQLite) and your intelligence (LiteRT).
+# Medha: The "Local Brain" Architecture 🧬🧠
 
-The "Local Brain" Workflow
-1. The Encoder (MediaPipe/LiteRT): When you type a note, you pass that text into a small Embedding Model (like all-MiniLM-L6-v2) via LiteRT. It spits out a list of numbers (a vector).
-2. The Memory (Nitro SQLite + sqlite-vec): You store that vector in a specialized VIRTUAL TABLE in SQLite.
-3. The Retrieval: When you ask, "What was that idea I had about the app last week?", the app vectorizes your question, runs a Distance Search in SQLite, and pulls up the 3 most relevant notes.
-4. The Assistant (LiteRT-LM): You feed those 3 notes + your question into a Gemma 2B model. It "reads" your notes and gives you a natural language answer.
+Medha is a privacy-first personal intelligence system that lives entirely on your mobile device. Unlike cloud-based AI, Medha's knowledge is stored in your own "Local Brain," an optimized combination of vector search and high-performance inference.
 
-Why this beats everything else:
-* Privacy: Not a single byte of your "Medha(Second Brain)" leaves the phone.
-* Speed: Since you're using JSI (Nitro) and C++ (sqlite-vec), the search happens in milliseconds, even with thousands of notes.
-* Reliability: SQLite is "battle-tested"—it won't corrupt your data like some newer, experimental mobile DBs might.
+### The "Local Brain" Workflow
+1. **The Encoder (llama.rn)**: When you save a note, Medha passes that text into a small Embedding Model (all-MiniLM-L6-v2) via the `llama.rn` engine. It generates a 384-dimension vector.
+2. **The Memory (Nitro SQLite + sqlite-vec)**: This vector is stored in a specialized `vec0` virtual table. We use a **Smart Hybrid Ranker** that combines semantic "closeness" with a strong +8.0 weight boost for exact keyword matches.
+3. **The Retrieval**: When you ask a question, Medha vectorizes your query, searches your memories, and pulls the most relevant notes to the top of the context window.
+4. **The Assistant (Reasoning Engine V2.1)**: Your query, the retrieved notes, and your **Recent Chat History** are fed into a GGUF model (Mistral, Phi, or Gemma). The assistant uses the **Strikeout Method** to audit the facts and provide a surgical, hallucination-free answer.
 
-How to start:
-1. Install Nitro SQLite: It provides the foundation for the fast C++ communication.
-2. Compile with sqlite-vec: You'll need to include the sqlite-vec.c extension in your native build (Android/iOS).
-3. Download an Embedding Model: Get a .tflite version of a sentence-transformer model to generate your vectors.
+### Why this architecture wins:
+* **Total Privacy**: 100% offline. Not a single byte of your data leaves the phone.
+* **Instant Speed**: Using JSI and C++ means searching thousands of notes happens in milliseconds.
+* **Algorithmic Logic**: The Strikeout reasoning solves common "Working Memory" failures in mobile LLMs, ensuring Medha stays honest and precise.
+
+---
+*Medha Technical Documentation — Intelligence V2.1 Update*

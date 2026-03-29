@@ -1,20 +1,24 @@
-import React, { useEffect, useState, useRef, useCallback } from 'react';
+import { Colors } from '@/constants/theme';
+import { useColorScheme } from '@/hooks/use-color-scheme';
+import { brainStore } from '@/utils/BrainStore';
+import { useFocusEffect } from '@react-navigation/native';
+import { Directory, File, Paths } from 'expo-file-system/next';
+import { initLlama, LlamaContext } from 'llama.rn';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
+  ActivityIndicator,
+  FlatList,
+  KeyboardAvoidingView,
+  Modal,
+  Platform,
+  SafeAreaView,
+  ScrollView,
   StyleSheet,
-  View,
   Text,
   TextInput,
   TouchableOpacity,
-  FlatList,
-  KeyboardAvoidingView,
-  Platform,
-  ActivityIndicator,
-  SafeAreaView,
+  View,
 } from 'react-native';
-import { Directory, Paths, File } from 'expo-file-system/next';
-import { initLlama, LlamaContext } from 'llama.rn';
-import { useColorScheme } from '@/hooks/use-color-scheme';
-import { brainStore } from '@/utils/BrainStore';
 
 // ── Types ──
 type MessageRole = 'user' | 'assistant' | 'system';
@@ -35,65 +39,129 @@ interface SystemStatus {
   chatModelInfo: string;
 }
 
-// ── Theme Colors ──
-const COLORS = {
-  dark: {
-    bg: '#0D0D0D',
-    surface: '#1A1A2E',
-    surfaceLight: '#252540',
-    accent: '#7C3AED',
-    accentLight: '#8B5CF6',
-    userBubble: '#7C3AED',
-    assistantBubble: '#1E1E38',
-    text: '#F1F1F6',
-    textSecondary: '#9CA3AF',
-    textMuted: '#6B7280',
-    border: '#2D2D4A',
-    success: '#10B981',
-    error: '#EF4444',
-    warning: '#F59E0B',
-    inputBg: '#1A1A2E',
-  },
-  light: {
-    bg: '#FAFAFE',
-    surface: '#FFFFFF',
-    surfaceLight: '#F3F4F6',
-    accent: '#7C3AED',
-    accentLight: '#8B5CF6',
-    userBubble: '#7C3AED',
-    assistantBubble: '#F3F4F6',
-    text: '#111827',
-    textSecondary: '#6B7280',
-    textMuted: '#9CA3AF',
-    border: '#E5E7EB',
-    success: '#10B981',
-    error: '#EF4444',
-    warning: '#F59E0B',
-    inputBg: '#F3F4F6',
-  },
-};
-
 // ── Status Badge ──
-function StatusBadge({ status, label }: { status: string; label: string }) {
+function StatusBadge({ status, label, onPress }: { status: string; label: string; onPress?: () => void }) {
   const colorScheme = useColorScheme() ?? 'dark';
-  const theme = COLORS[colorScheme];
+  const theme = Colors[colorScheme];
   const color =
     status === 'ready'
       ? theme.success
       : status === 'loading'
-        ? theme.warning
+        ? theme.accent
         : theme.error;
 
   return (
-    <View style={[styles.badge, { backgroundColor: color + '20', borderColor: color + '40' }]}>
+    <TouchableOpacity 
+      onPress={onPress}
+      disabled={!onPress}
+      style={[styles.badge, { backgroundColor: color + '15', borderColor: color + '30' }]}
+    >
       <View style={[styles.badgeDot, { backgroundColor: color }]} />
       <Text style={[styles.badgeText, { color }]}>{label}</Text>
-    </View>
+    </TouchableOpacity>
   );
 }
 
+const ANALYTICAL_PROMPT_TEMPLATE = `You are Medha, an analytical RAG assistant. Your goal is to provide precise answers based ONLY on the provided CONTEXT, using strict logic.
+
+---
+REASONING FRAMEWORK:
+
+1. ENTITY ISOLATION & SUBJECT PINNING: 
+   - Identify the "Primary Subject" from the user's question. 
+   - Treat notes about other people as background noise. Do NOT merge data between different names.
+
+2. LOGICAL INFERENCE (ACTION -> STATE):
+   - "I gave [Amount] to [Person]" -> [Person] owes you that amount.
+   - "[Person] paid back [Amount]" -> Subtract from their debt.
+   - "I started [Task]" -> The task is currently "In Progress."
+
+3. TOPIC SILOING:
+   - Do NOT substitute nouns for relationship terms. If the note says "Surya," stay with "Surya."
+
+4. CHRONOLOGY:
+   - Always evaluate surviving facts in the order they occurred to calculate the final net state.
+
+---
+YOUR TASK:
+Use the **"Strikeout Method"** to process the CONTEXT. Do not skip steps.
+
+<scratchpad>
+1. Primary Subject: [Who/What is this specifically about?]
+2. Raw Facts: [List ALL facts found in the CONTEXT.]
+3. Strikeout (Filtering): [Explicitly list which facts from Step 2 do NOT mention the Primary Subject and REJECT them.]
+4. Bailout Check: [If 0 facts remain after Step 3, write "ABORT" and skip to the final answer.]
+5. Net State Calculation: [Chronologically apply the Action->State rules to the surviving facts to find the final result.]
+</scratchpad>
+
+ANSWER: 
+- If Step 4 says "ABORT", you MUST respond exactly with: "I don't have enough clear information in your notes to answer that."
+- Otherwise, provide a concise, direct answer based ONLY on Step 5. Do NOT explain your math in the final answer.
+
+CONTEXT:
+{CONTEXT}
+
+RECENT CONVERSATION:
+{CHAT_HISTORY}
+
+USER QUESTION:
+{QUESTION}`;
+
+/**
+ * Generates a model-specific prompt based on the GGUF filename.
+ * Supports Llama 3, Gemma 2, Mistral, DeepSeek, and ChatML (Qwen/Phi).
+ */
+function formatPrompt(modelName: string, systemTemplate: string, context: string, userQuery: string, history: string): string {
+  const name = modelName.toLowerCase();
+  const retrievalContext = context || "No context provided.";
+  
+  // 1. Fill the template placeholders
+  const processedSystem = systemTemplate
+    .replace('{CONTEXT}', retrievalContext)
+    .replace('{CHAT_HISTORY}', history || "No previous messages.")
+    .replace('{QUESTION}', userQuery);
+
+  // 2. Wrap in model-specific tags
+  
+  // Llama 3.x / 3.2 Instruct
+  if (name.includes('llama-3')) {
+    return `<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n${processedSystem}<|eot_id|>` +
+           `<|start_header_id|>assistant<|end_header_id|>\n\n`;
+  }
+
+  // Phi-3 / Phi-3.5
+  if (name.includes('phi-3')) {
+    return `<|user|>\n${processedSystem}<|end|>\n<|assistant|>`;
+  }
+
+  // ChatML (Qwen, DeepSeek-R1 Distill)
+  if (name.includes('qwen') || name.includes('deepseek')) {
+    return `<|im_start|>system\n${processedSystem}<|im_end|>\n` +
+           `<|im_start|>user\nProvide the response as requested.<|im_end|>\n` +
+           `<|im_start|>assistant\n`;
+  }
+
+  // Gemma 2 IT
+  if (name.includes('gemma')) {
+    return `<start_of_turn>user\n${processedSystem}<end_of_turn>\n<start_of_turn>model\n`;
+  }
+
+  // Mistral / Mixtral [Inst]
+  if (name.includes('mistral') || name.includes('mixtral') || name.includes('pixtral')) {
+    return `[INST] ${processedSystem} [/INST]`;
+  }
+
+  // DeepSeek / Alpaca / Generic
+  if (name.includes('alpaca')) {
+    return `### Instruction:\n${processedSystem}\n\n### Response:\n`;
+  }
+
+  // Default fallback (Modified Alpaca style)
+  return `### System:\n${processedSystem}\n\n### User:\nAnswer the query from the context above.\n\n### Assistant:\n`;
+}
+
 // ── Chat Bubble ──
-function ChatBubble({ message, theme }: { message: ChatMessage; theme: typeof COLORS.dark }) {
+function ChatBubble({ message, theme }: { message: ChatMessage; theme: typeof Colors.dark }) {
   const isUser = message.role === 'user';
   const isSystem = message.role === 'system';
 
@@ -102,7 +170,7 @@ function ChatBubble({ message, theme }: { message: ChatMessage; theme: typeof CO
       <View style={styles.systemMsgContainer}>
         <Text
           selectable={true}
-          style={[styles.systemMsgText, { color: theme.textMuted }]}
+          style={[styles.systemMsgText, { color: theme.subtitle }]}
         >
           {message.content}
         </Text>
@@ -142,7 +210,7 @@ function ChatBubble({ message, theme }: { message: ChatMessage; theme: typeof CO
         <Text
           style={[
             styles.timestamp,
-            { color: isUser ? 'rgba(255,255,255,0.5)' : theme.textMuted },
+            { color: isUser ? 'rgba(255,255,255,0.7)' : theme.subtitle },
           ]}
         >
           {message.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
@@ -155,7 +223,7 @@ function ChatBubble({ message, theme }: { message: ChatMessage; theme: typeof CO
 // ── Main Screen ──
 export default function ChatScreen() {
   const colorScheme = useColorScheme() ?? 'dark';
-  const theme = COLORS[colorScheme];
+  const theme = Colors[colorScheme];
 
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [inputText, setInputText] = useState('');
@@ -171,6 +239,7 @@ export default function ChatScreen() {
 
   const [availableModels, setAvailableModels] = useState<string[]>([]);
   const [selectedModel, setSelectedModel] = useState<string | null>(null);
+  const [isModelModalVisible, setIsModelModalVisible] = useState(false);
 
   const flatListRef = useRef<FlatList>(null);
   const embedContextRef = useRef<LlamaContext | null>(null);
@@ -195,6 +264,35 @@ export default function ChatScreen() {
   useEffect(() => {
     initializeSystems();
   }, []);
+
+  // Refresh model list when screen comes into focus
+  useFocusEffect(
+    useCallback(() => {
+      refreshModelList();
+    }, [])
+  );
+
+  async function refreshModelList() {
+    try {
+      const dir = new Directory(Paths.document);
+      const contents = dir.list();
+      const files = contents.map(item => item.name).filter(f => f.endsWith('.gguf'));
+      const chatModels = files.filter(f => !f.includes('MiniLM'));
+      setAvailableModels(chatModels);
+      
+      // Force sync with BrainStore: if BrainStore has a different model active, switch to it
+      if (brainStore.activeChatModel && brainStore.activeChatModel !== selectedModel) {
+        setSelectedModel(brainStore.activeChatModel);
+      } else if (!selectedModel && chatModels.length > 0) {
+        // Fallback for first load
+        const fallback = brainStore.activeChatModel || chatModels[0];
+        setSelectedModel(fallback);
+        brainStore.activeChatModel = fallback;
+      }
+    } catch (e) {
+      console.warn('Silent model list refresh failed', e);
+    }
+  }
 
   async function initializeSystems() {
     addSystemMessage('🧠 Initializing Medha...');
@@ -247,6 +345,10 @@ export default function ChatScreen() {
         )
       `);
 
+      // ── Hybrid Search: Add FTS5 Virtual Table ──
+      // Note: Reverted FTS5 due to environment module absence.
+      // We now use LIKE-based weighting directly in the vector query for maximum compatibility.
+
       setStatus((prev) => ({
         ...prev,
         sqliteVec: 'ready',
@@ -297,9 +399,11 @@ export default function ChatScreen() {
         addSystemMessage('⚠️ Missing embedding model. Please download it in the Models tab.');
       }
 
-      // Auto-select first chat model if available
+      // Auto-select model: check BrainStore first, then fall back to first chat model
       if (chatModels.length > 0) {
-        setSelectedModel(chatModels[0]);
+        const initial = brainStore.activeChatModel || chatModels[0];
+        setSelectedModel(initial);
+        brainStore.activeChatModel = initial;
       } else {
         setStatus(p => ({ ...p, chatModel: 'not_found', chatModelInfo: 'No chat model downloaded' }));
         addSystemMessage('⚠️ No chat model found. Please download one in the Models tab.');
@@ -355,6 +459,13 @@ export default function ChatScreen() {
     };
   }, [selectedModel]);
 
+  // Sync back to BrainStore if changed from within index.tsx
+  useEffect(() => {
+    if (selectedModel) {
+      brainStore.activeChatModel = selectedModel;
+    }
+  }, [selectedModel]);
+
   // ── Send message ──
   async function handleSend() {
     const text = inputText.trim();
@@ -374,6 +485,7 @@ export default function ChatScreen() {
     setMessages((prev) => [...prev, userMessage]);
     setInputText('');
     setIsThinking(true);
+    addSystemMessage("🧠 Looking into memories...");
 
     try {
       // 1. Slash command for adding a note to the Brain
@@ -385,8 +497,13 @@ export default function ChatScreen() {
         const buffer = new Uint8Array(f32Array.buffer);
         
         const insertRes = dbRef.current.execute('INSERT INTO notes (content) VALUES (?)', [noteContent]);
-        const lastId = insertRes.insertId ?? Math.floor(Math.random() * 100000); // Fallback if insertId is missing
+        let lastId = insertRes.insertId;
+        if (!lastId) {
+          const idRes = dbRef.current.execute('SELECT last_insert_rowid() as id');
+          lastId = idRes.rows?._array?.[0]?.id || idRes.rows?.item?.(0)?.id || idRes.rows?.[0]?.id;
+        }
         
+        // Insert into Vector Table (Semantic)
         dbRef.current.execute(`INSERT INTO notes_vec (rowid, embedding) VALUES (${Math.floor(Number(lastId))}, ?)`, [f32Array.buffer]);
         
         setMessages((prev) => [
@@ -397,21 +514,27 @@ export default function ChatScreen() {
         return;
       }
 
-      // 2. Vectorize the User Query
+      // 2. Vectorize and Extract keywords
       const embedResult = await embedContextRef.current.embedding(text);
       const f32Array = new Float32Array(embedResult.embedding);
-      const buffer = new Uint8Array(f32Array.buffer);
+      const words = text.split(/\s+/).filter(w => w.length > 3);
+      const mainKeyword = words.length > 0 ? words[0] : text;
 
-      // 3. Search Database
+      // 3. Hybrid Search: Semantic (Vector) + Keyword Weighting (LIKE)
       const searchRes = dbRef.current.execute(
         `
-        SELECT notes.content, notes_vec.distance
+        SELECT 
+          notes.id, 
+          notes.content, 
+          (1.0 / (notes_vec.distance + 0.01)) + (CASE WHEN notes.content LIKE ? OR notes.content LIKE ? THEN 8.0 ELSE 0.0 END) as total_rank
         FROM notes_vec
         JOIN notes ON notes.id = notes_vec.rowid
-        WHERE embedding MATCH ? AND k = 3
-        ORDER BY distance
+        WHERE embedding MATCH ? AND k = 10
+        ORDER BY total_rank DESC
+        LIMIT 7
         `,
-        [f32Array.buffer]
+        // We match both capitalized and lowercase for robustness
+        [`%${mainKeyword}%`, `%${mainKeyword.toLowerCase()}%`, f32Array.buffer]
       );
 
       let contextStr = '';
@@ -425,10 +548,22 @@ export default function ChatScreen() {
       }
       if (topNotes.length > 0) {
         contextStr = 'RELEVANT NOTES:\n' + topNotes.map((n: any) => `- ${n.content}`).join('\n') + '\n\n';
+        addSystemMessage(`🧠 Insight: Found ${topNotes.length} memories related to your query.`);
+        console.log("🧠 MEDHA RAG DEBUG - Retrieved Context:", contextStr);
+      } else {
+        addSystemMessage("🧠 Insight: No specific memories found for this query.");
+        console.log("🧠 MEDHA RAG DEBUG - No relevant notes found for query:", text);
       }
 
-      // 4. Construct Prompt
-      const prompt = `<start_of_turn>user\n${contextStr}${text}<end_of_turn>\n<start_of_turn>model\n`;
+      // 4. Construct Chat History for context pinning (Last 4 messages)
+      const historyStr = messages
+        .filter(m => m.role !== 'system')
+        .slice(-4)
+        .map(m => `${m.role.toUpperCase()}: ${m.content}`)
+        .join('\n');
+
+      // 5. Construct Prompt Dynamically
+      const finalPrompt = formatPrompt(selectedModel || '', ANALYTICAL_PROMPT_TEMPLATE, contextStr, text, historyStr);
 
       const responseId = (Date.now() + 1).toString();
       setMessages((prev) => [
@@ -438,7 +573,7 @@ export default function ChatScreen() {
 
       // 5. Stream Tokens
       await chatContextRef.current.completion(
-        { prompt, n_predict: 256, temperature: 0.7 },
+        { prompt: finalPrompt, n_predict: 512, temperature: 0.1 },
         (res) => {
           setMessages((prev) => 
             prev.map((msg) => 
@@ -467,7 +602,7 @@ export default function ChatScreen() {
 
   // ── Render ──
   return (
-    <SafeAreaView style={[styles.container, { backgroundColor: theme.bg }]}>
+    <SafeAreaView style={[styles.container, { backgroundColor: theme.background }]}>
       {/* Header */}
       <View style={[styles.header, { borderBottomColor: theme.border }]}>
         <View style={styles.headerLeft}>
@@ -476,7 +611,7 @@ export default function ChatScreen() {
           </View>
           <View>
             <Text style={[styles.headerTitle, { color: theme.text }]}>Medha</Text>
-            <Text style={[styles.headerSubtitle, { color: theme.textSecondary }]}>
+            <Text style={[styles.headerSubtitle, { color: theme.subtitle }]}>
               Your Second Brain
             </Text>
           </View>
@@ -505,6 +640,7 @@ export default function ChatScreen() {
            <StatusBadge
             status={status.chatModel}
             label={status.chatModel === 'ready' ? 'Thinker' : 'Think !'}
+            onPress={() => setIsModelModalVisible(true)}
           />
         </View>
       </View>
@@ -528,7 +664,7 @@ export default function ChatScreen() {
               <Text style={[styles.emptyTitle, { color: theme.text }]}>
                 Welcome to Medha
               </Text>
-              <Text style={[styles.emptySubtitle, { color: theme.textSecondary }]}>
+              <Text style={[styles.emptySubtitle, { color: theme.subtitle }]}>
                 Your private, on-device AI assistant.{'\n'}
                 Initializing systems...
               </Text>
@@ -540,7 +676,7 @@ export default function ChatScreen() {
         {isThinking && (
           <View style={[styles.thinkingBar, { backgroundColor: theme.surface }]}>
             <ActivityIndicator size="small" color={theme.accent} />
-            <Text style={[styles.thinkingText, { color: theme.textSecondary }]}>
+            <Text style={[styles.thinkingText, { color: theme.subtitle }]}>
               Medha is thinking...
             </Text>
           </View>
@@ -551,7 +687,7 @@ export default function ChatScreen() {
             style={[
               styles.input,
               {
-                backgroundColor: theme.inputBg,
+                backgroundColor: theme.assistantBubble,
                 color: theme.text,
                 borderColor: theme.border,
               },
@@ -559,7 +695,7 @@ export default function ChatScreen() {
             value={inputText}
             onChangeText={setInputText}
             placeholder="Ask Medha anything..."
-            placeholderTextColor={theme.textMuted}
+            placeholderTextColor={theme.subtitle}
             multiline
             maxLength={2000}
             onSubmitEditing={handleSend}
@@ -572,7 +708,7 @@ export default function ChatScreen() {
               styles.sendButton,
               {
                 backgroundColor:
-                  inputText.trim() && !isThinking ? theme.accent : theme.surfaceLight,
+                  inputText.trim() && !isThinking ? theme.accent : theme.border,
               },
             ]}
           >
@@ -581,7 +717,7 @@ export default function ChatScreen() {
                 styles.sendButtonText,
                 {
                   color:
-                    inputText.trim() && !isThinking ? '#FFFFFF' : theme.textMuted,
+                    inputText.trim() && !isThinking ? '#FFFFFF' : theme.subtitle,
                 },
               ]}
             >
@@ -590,6 +726,64 @@ export default function ChatScreen() {
           </TouchableOpacity>
         </View>
       </KeyboardAvoidingView>
+
+      {/* Model Selector Modal */}
+      <Modal
+        visible={isModelModalVisible}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setIsModelModalVisible(false)}
+      >
+        <TouchableOpacity 
+          style={styles.modalOverlay} 
+          activeOpacity={1} 
+          onPress={() => setIsModelModalVisible(false)}
+        >
+          <View style={[styles.modalContent, { backgroundColor: theme.surface, borderColor: theme.border }]}>
+            <Text style={[styles.modalTitle, { color: theme.text }]}>Switch Thinker Model</Text>
+            <Text style={[styles.modalSubtitle, { color: theme.subtitle }]}>Select active brain for chat</Text>
+            
+            <ScrollView style={styles.modalList} showsVerticalScrollIndicator={false}>
+              {availableModels.length === 0 ? (
+                <Text style={{ color: theme.subtitle, textAlign: 'center', padding: 20 }}>
+                  No other models found. Download more in the Models tab!
+                </Text>
+              ) : (
+                availableModels.map((model) => (
+                  <TouchableOpacity
+                    key={model}
+                    style={[
+                      styles.modelOption,
+                      { borderColor: theme.border },
+                      selectedModel === model && { backgroundColor: theme.accent + '20', borderColor: theme.accent }
+                    ]}
+                    onPress={() => {
+                      setSelectedModel(model);
+                      setIsModelModalVisible(false);
+                    }}
+                  >
+                    <Text style={[
+                      styles.modelOptionText, 
+                      { color: theme.text },
+                      selectedModel === model && { color: theme.accent, fontWeight: '700' }
+                    ]}>
+                      {model.replace('.gguf', '')}
+                    </Text>
+                    {selectedModel === model && <Text style={{ color: theme.accent, fontWeight: '800' }}>✓</Text>}
+                  </TouchableOpacity>
+                ))
+              )}
+            </ScrollView>
+            
+            <TouchableOpacity 
+              style={[styles.modalCloseBtn, { backgroundColor: theme.border }]} 
+              onPress={() => setIsModelModalVisible(false)}
+            >
+              <Text style={[styles.modalCloseText, { color: theme.text }]}>Cancel</Text>
+            </TouchableOpacity>
+          </View>
+        </TouchableOpacity>
+      </Modal>
     </SafeAreaView>
   );
 }
@@ -606,9 +800,14 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'space-between',
     paddingHorizontal: 16,
-    paddingVertical: 12,
-    paddingTop: Platform.OS === 'android' ? 40 : 12,
+    paddingVertical: 14,
+    paddingTop: Platform.OS === 'android' ? 45 : 12,
     borderBottomWidth: 1,
+    elevation: 2,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.1,
+    shadowRadius: 2,
   },
   headerLeft: {
     flexDirection: 'row',
@@ -624,19 +823,22 @@ const styles = StyleSheet.create({
   },
   headerIconText: {
     color: '#FFFFFF',
-    fontSize: 18,
-    fontWeight: '700',
+    fontSize: 20,
+    fontWeight: '800',
   },
   headerTitle: {
-    fontSize: 20,
-    fontWeight: '700',
+    fontSize: 22,
+    fontWeight: '800',
+    letterSpacing: -0.5,
   },
   headerSubtitle: {
     fontSize: 12,
-    marginTop: 1,
+    fontWeight: '500',
+    marginTop: -1,
   },
   headerBadges: {
     flexDirection: 'row',
+    alignItems: 'center',
     gap: 6,
   },
 
@@ -644,41 +846,43 @@ const styles = StyleSheet.create({
   badge: {
     flexDirection: 'row',
     alignItems: 'center',
-    paddingHorizontal: 8,
-    paddingVertical: 4,
-    borderRadius: 12,
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 14,
     borderWidth: 1,
-    gap: 4,
+    gap: 6,
   },
   badgeDot: {
-    width: 6,
-    height: 6,
-    borderRadius: 3,
+    width: 7,
+    height: 7,
+    borderRadius: 4,
   },
   badgeText: {
     fontSize: 10,
-    fontWeight: '600',
+    fontWeight: '700',
+    textTransform: 'uppercase',
+    letterSpacing: 0.5,
   },
 
   // Messages
   messageList: {
     paddingHorizontal: 16,
-    paddingVertical: 12,
+    paddingVertical: 16,
     flexGrow: 1,
   },
 
   // Bubble
   bubbleRow: {
     flexDirection: 'row',
-    marginBottom: 12,
-    maxWidth: '85%',
+    marginBottom: 16,
+    maxWidth: '88%',
   },
   bubbleRowUser: {
     alignSelf: 'flex-end',
   },
   bubbleRowAssistant: {
     alignSelf: 'flex-start',
-    gap: 8,
+    gap: 10,
   },
   avatar: {
     width: 32,
@@ -686,44 +890,53 @@ const styles = StyleSheet.create({
     borderRadius: 10,
     alignItems: 'center',
     justifyContent: 'center',
-    marginTop: 4,
+    marginTop: 2,
   },
   avatarText: {
     color: '#FFFFFF',
     fontSize: 14,
-    fontWeight: '700',
+    fontWeight: '800',
   },
   bubble: {
-    paddingHorizontal: 14,
-    paddingVertical: 10,
-    borderRadius: 18,
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    borderRadius: 22,
     maxWidth: '100%',
+    elevation: 1,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.05,
+    shadowRadius: 1,
   },
   userBubble: {
-    borderBottomRightRadius: 6,
+    borderBottomRightRadius: 4,
   },
   assistantBubble: {
-    borderBottomLeftRadius: 6,
+    borderBottomLeftRadius: 4,
   },
   bubbleText: {
-    fontSize: 15,
-    lineHeight: 22,
+    fontSize: 16,
+    lineHeight: 24,
+    fontWeight: '400',
   },
   timestamp: {
     fontSize: 10,
-    marginTop: 4,
+    marginTop: 6,
     alignSelf: 'flex-end',
+    fontWeight: '600',
   },
 
   // System message
   systemMsgContainer: {
     alignItems: 'center',
-    marginVertical: 6,
+    marginVertical: 10,
+    paddingHorizontal: 40,
   },
   systemMsgText: {
     fontSize: 12,
-    fontStyle: 'italic',
+    fontWeight: '500',
     textAlign: 'center',
+    opacity: 0.7,
   },
 
   // Empty state
@@ -731,70 +944,129 @@ const styles = StyleSheet.create({
     flex: 1,
     alignItems: 'center',
     justifyContent: 'center',
-    paddingTop: 120,
+    paddingTop: 140,
   },
   emptyIcon: {
-    fontSize: 56,
-    marginBottom: 16,
+    fontSize: 64,
+    marginBottom: 20,
   },
   emptyTitle: {
-    fontSize: 24,
-    fontWeight: '700',
-    marginBottom: 8,
+    fontSize: 28,
+    fontWeight: '800',
+    marginBottom: 10,
+    letterSpacing: -0.5,
   },
   emptySubtitle: {
-    fontSize: 14,
+    fontSize: 15,
     textAlign: 'center',
-    lineHeight: 22,
+    lineHeight: 24,
+    maxWidth: '80%',
   },
 
   // Thinking
   stopButton: {
-    paddingHorizontal: 12,
+    paddingHorizontal: 10,
     paddingVertical: 6,
-    borderRadius: 8,
-    borderWidth: 1,
+    borderRadius: 12,
+    borderWidth: 1.5,
     justifyContent: 'center',
     alignItems: 'center',
   },
   thinkingBar: {
     flexDirection: 'row',
     alignItems: 'center',
-    paddingHorizontal: 20,
-    paddingVertical: 8,
-    gap: 8,
+    paddingHorizontal: 24,
+    paddingVertical: 10,
+    gap: 10,
   },
   thinkingText: {
-    fontSize: 13,
+    fontSize: 14,
+    fontWeight: '600',
   },
 
   // Input
   inputContainer: {
     flexDirection: 'row',
     alignItems: 'flex-end',
-    paddingHorizontal: 12,
-    paddingVertical: 10,
+    paddingHorizontal: 16,
+    paddingVertical: 14,
     borderTopWidth: 1,
-    gap: 8,
+    gap: 10,
   },
   input: {
     flex: 1,
-    borderRadius: 20,
-    paddingHorizontal: 16,
-    paddingVertical: 10,
-    fontSize: 15,
-    maxHeight: 120,
+    borderRadius: 24,
+    paddingHorizontal: 18,
+    paddingVertical: 12,
+    fontSize: 16,
+    maxHeight: 140,
     borderWidth: 1,
   },
   sendButton: {
-    width: 40,
-    height: 40,
-    borderRadius: 20,
+    width: 44,
+    height: 44,
+    borderRadius: 22,
     alignItems: 'center',
     justifyContent: 'center',
+    elevation: 2,
   },
   sendButtonText: {
-    fontSize: 20,
+    fontSize: 22,
+    fontWeight: '800',
+  },
+
+  // Modal
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.6)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: 20,
+  },
+  modalContent: {
+    width: '100%',
+    maxHeight: '60%',
+    borderRadius: 24,
+    borderWidth: 1,
+    padding: 24,
+    elevation: 10,
+  },
+  modalTitle: {
+    fontSize: 22,
+    fontWeight: '800',
+    marginBottom: 4,
+    textAlign: 'center',
+  },
+  modalSubtitle: {
+    fontSize: 14,
+    textAlign: 'center',
+    marginBottom: 20,
+    fontWeight: '500',
+  },
+  modalList: {
+    marginVertical: 10,
+  },
+  modelOption: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    padding: 16,
+    borderRadius: 16,
+    borderWidth: 1,
+    marginBottom: 10,
+  },
+  modelOptionText: {
+    fontSize: 15,
+    fontWeight: '600',
+  },
+  modalCloseBtn: {
+    marginTop: 10,
+    padding: 14,
+    borderRadius: 16,
+    alignItems: 'center',
+  },
+  modalCloseText: {
     fontWeight: '700',
+    fontSize: 15,
   },
 });
