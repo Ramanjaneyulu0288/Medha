@@ -787,70 +787,96 @@ function pickBestChatModel(models: string[]): string | null {
         if (intent === 'FINANCIAL_QUERY') {
           console.log(`[handleSend] FINANCIAL_QUERY: Querying ledger for "${text}"`);
           const targetPerson = extractFinancialTargetPerson(text);
-          let ledgerSummaryStr = '';
 
           if (targetPerson) {
             personSummary = getPersonBalance(dbRef.current, targetPerson);
             if (personSummary) {
               const owesText =
                 personSummary.netBalance > 0
-                  ? `${personSummary.person} owes you ₹${personSummary.netBalance}. You do not owe ${personSummary.person} anything.`
+                  ? `${personSummary.person} owes you ₹${personSummary.netBalance}.`
                   : personSummary.netBalance < 0
-                    ? `You owe ${personSummary.person} ₹${Math.abs(personSummary.netBalance)}. ${personSummary.person} does not owe you anything.`
-                    : `All dues are completely settled with ${personSummary.person} (balance is ₹0). Neither of you owes anything.`;
+                    ? `You owe ${personSummary.person} ₹${Math.abs(personSummary.netBalance)}.`
+                    : `All dues are settled with ${personSummary.person} (balance is ₹0).`;
 
-              const txListStr = personSummary.transactions
-                .map((t) => `- ${t.direction === 'GAVE' ? 'You lent' : 'You received'} ₹${t.amount}: "${t.note_content || ''}"`)
-                .join('\n');
+              let directMsg = `📊 **Balance with ${personSummary.person}**:\n`;
+              directMsg += `• **Lent / Paid**: ₹${personSummary.totalGave}\n`;
+              directMsg += `• **Received**: ₹${personSummary.totalReceived}\n`;
+              directMsg += `• **Status**: ${owesText}`;
 
-              ledgerSummaryStr = `DETERMINISTIC FINANCIAL LEDGER FOR ${personSummary.person.toUpperCase()}:
-- Total you lent/paid: ₹${personSummary.totalGave}
-- Total you received: ₹${personSummary.totalReceived}
-- Net Balance: ₹${personSummary.netBalance}
-- EXACT STATUS: ${owesText}
-Transaction History:
-${txListStr}
-
-CRITICAL INSTRUCTION:
-Base your answer STRICTLY on the EXACT numbers above.
-State clearly:
-1. Total you lent/paid: ₹${personSummary.totalGave}
-2. Total you received: ₹${personSummary.totalReceived}
-3. Final Net Balance: ${owesText}
-Never hallucinate or invert who owes whom!`;
-              addSystemMessage(`📊 Ledger: Found exact balance for ${personSummary.person}.`);
+              setMessages((prev) => [
+                ...prev,
+                {
+                  id: Date.now().toString(),
+                  role: 'assistant',
+                  content: directMsg,
+                  timestamp: new Date(),
+                  ledgerPersonSummary: personSummary,
+                },
+              ]);
+              brainStore.isGenerating = false;
+              setIsThinking(false);
+              return;
             } else {
-              ledgerSummaryStr = `LEDGER RESULT:
-No financial transactions or debts are recorded for "${targetPerson}".
-Tell the user clearly that they have no recorded money or debt transactions with ${targetPerson} in their saved notes.`;
-              addSystemMessage(`📊 Ledger: No transactions found for ${targetPerson}.`);
+              setMessages((prev) => [
+                ...prev,
+                {
+                  id: Date.now().toString(),
+                  role: 'assistant',
+                  content: `I searched your notes, but couldn't find any financial transactions or debt records with "${targetPerson}".`,
+                  timestamp: new Date(),
+                },
+              ]);
+              brainStore.isGenerating = false;
+              setIsThinking(false);
+              return;
             }
           } else {
             overallSummary = getAllBalances(dbRef.current);
-            const creditorsList = overallSummary.creditors.length > 0
-              ? overallSummary.creditors.map((c) => `- ${c.person} owes you ₹${c.amountOwedToUser}`).join('\n')
-              : '- No one owes you money.';
-            const debtorsList = overallSummary.debtors.length > 0
-              ? overallSummary.debtors.map((d) => `- You owe ${d.person} ₹${d.amountUserOwes}`).join('\n')
-              : '- You do not owe anyone money.';
+            let directMsg = `📊 **Overall Financial Summary**:\n\n`;
 
-            ledgerSummaryStr = `OVERALL FINANCIAL DEBT SUMMARY:
-People who owe you:
-${creditorsList}
-- Total others owe you: ₹${overallSummary.totalOwedToUser}
+            if (overallSummary.totalUserOwes > 0) {
+              directMsg += `• **Total Debt (You owe others)**: ₹${overallSummary.totalUserOwes}\n`;
+              for (const d of overallSummary.debtors) {
+                directMsg += `   - You owe ${d.person}: ₹${d.amountUserOwes}\n`;
+              }
+            } else {
+              directMsg += `• **Total Debt (You owe others)**: ₹0 (No debts!)\n`;
+            }
 
-People you owe:
-${debtorsList}
-- Total you owe others: ₹${overallSummary.totalUserOwes}
+            directMsg += `\n`;
 
-Overall Net Position: ${overallSummary.netBalance >= 0 ? `+₹${overallSummary.netBalance}` : `-₹${Math.abs(overallSummary.netBalance)}`}
+            if (overallSummary.totalOwedToUser > 0) {
+              directMsg += `• **Total Receivables (Others owe you)**: ₹${overallSummary.totalOwedToUser}\n`;
+              for (const c of overallSummary.creditors) {
+                directMsg += `   - ${c.person} owes you: ₹${c.amountOwedToUser}\n`;
+              }
+            } else {
+              directMsg += `• **Total Receivables (Others owe you)**: ₹0\n`;
+            }
 
-CRITICAL INSTRUCTION:
-Answer the user with this exact breakdown. Do not guess any amounts.`;
-            addSystemMessage('📊 Ledger: Retrieved overall debt summary.');
+            directMsg += `\n`;
+            if (overallSummary.netBalance > 0) {
+              directMsg += `• **Net Position**: **+₹${overallSummary.netBalance}** (You are net positive / owed more than you owe).`;
+            } else if (overallSummary.netBalance < 0) {
+              directMsg += `• **Net Position**: **-₹${Math.abs(overallSummary.netBalance)}** (You owe more than you are owed).`;
+            } else {
+              directMsg += `• **Net Position**: **₹0** (All dues are completely balanced).`;
+            }
+
+            setMessages((prev) => [
+              ...prev,
+              {
+                id: Date.now().toString(),
+                role: 'assistant',
+                content: directMsg,
+                timestamp: new Date(),
+                ledgerOverallSummary: overallSummary,
+              },
+            ]);
+            brainStore.isGenerating = false;
+            setIsThinking(false);
+            return;
           }
-
-          contextStr = ledgerSummaryStr;
         } else {
           // ── RAG PIPELINE: Runs for other queries and memories ──
           console.log(`[handleSend] RAG Pipeline starting for intent: ${intent}`);
