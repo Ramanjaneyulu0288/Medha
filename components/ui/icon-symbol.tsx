@@ -17,7 +17,8 @@ const MAPPING = {
   'house.fill': 'home',
   'paperplane.fill': 'send',
   'message.fill': 'chat-bubble',
-  'chevron.left.forwardslash.chevron.right': 'code',
+  'list.bullet': 'format-list-bulleted',
+  'chevron.left.forwardslash.chevron.right': 'memory',
   'chevron.right': 'chevron-right',
 } as IconMapping;
 

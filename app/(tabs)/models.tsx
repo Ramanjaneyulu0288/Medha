@@ -4,11 +4,12 @@ import { brainStore } from '@/utils/BrainStore';
 import { useFocusEffect } from '@react-navigation/native';
 import * as FileSystemLegacy from 'expo-file-system/legacy';
 import { Directory, File, Paths } from 'expo-file-system/next';
+import * as Haptics from 'expo-haptics';
 import React, { useCallback, useEffect, useState } from 'react';
-import { FlatList, Platform, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import { FlatList, InteractionManager, Platform, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
-type ModelInfo = {
+export type ModelInfo = {
   id: string;
   name: string;
   description: string;
@@ -18,70 +19,102 @@ type ModelInfo = {
   type: 'embedding' | 'chat';
 };
 
-const AVAILABLE_MODELS: ModelInfo[] = [
+export const AVAILABLE_MODELS: ModelInfo[] = [
+  // ── 1. EMBEDDING MODELS (Nomic Embed Text v1.5 - 768 Dimensions) ──
   {
-    id: 'minilm',
-    name: 'all-MiniLM-L6-v2 (Embedding)',
-    description: 'Required: Small embedding model for converting notes into searchable vectors.',
-    url: 'https://huggingface.co/bartowski/all-MiniLM-L6-v2-GGUF/resolve/main/all-MiniLM-L6-v2-Q8_0.gguf?download=true',
-    filename: 'all-MiniLM-L6-v2.gguf',
-    sizeEstimate: '45 MB',
+    id: 'nomic-embed-text-v1.5-q8',
+    name: 'Nomic Embed Text v1.5 (Recommended) ⭐',
+    description: 'High-precision 768-dim embeddings. 8192 context window and native asymmetric retrieval.',
+    url: 'https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF/resolve/main/nomic-embed-text-v1.5.Q8_0.gguf',
+    filename: 'nomic-embed-text-v1.5.Q8_0.gguf',
+    sizeEstimate: '139 MB',
     type: 'embedding',
   },
-  // {
-  //   id: 'deepseek-r1-1.5b',
-  //   name: 'DeepSeek-R1 1.5B Distill',
-  //   description: 'High-tier reasoning distilled from R1. Best balance of logic and speed for mobile.',
-  //   url: 'https://huggingface.co/bartowski/DeepSeek-R1-Distill-Qwen-1.5B-GGUF/resolve/main/DeepSeek-R1-Distill-Qwen-1.5B-Q4_K_M.gguf?download=true',
-  //   filename: 'deepseek-r1-1.5b-q4_k_m.gguf',
-  //   sizeEstimate: '1.1 GB',
-  //   type: 'chat',
-  // },
-  // {
-  //   id: 'llama-3.2-1b',
-  //   name: 'Llama 3.2 1B (Q4_K_M)',
-  //   description: 'Meta’s ultra-lightweight generalist. Extremely fast response times.',
-  //   url: 'https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q4_K_M.gguf?download=true',
-  //   filename: 'llama-3.2-1b-q4_k_m.gguf',
-  //   sizeEstimate: '800 MB',
-  //   type: 'chat',
-  // },
   {
-    id: 'phi-3.5-mini',
-    name: 'Phi-3.5 Mini Instruct',
-    description: 'Microsoft’s compact reasoning model. Excellent at following complex multi-step instructions.',
-    url: 'https://huggingface.co/bartowski/Phi-3.5-mini-instruct-GGUF/resolve/main/Phi-3.5-mini-instruct-Q4_K_M.gguf?download=true',
-    filename: 'phi-3.5-mini-q4_k_m.gguf',
+    id: 'nomic-embed-text-v1.5-q4',
+    name: 'Nomic Embed Text v1.5 (Q4_K_M)',
+    description: 'Ultra-compact 768-dim embeddings. 8192 context window, optimized for minimal mobile RAM.',
+    url: 'https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF/resolve/main/nomic-embed-text-v1.5.Q4_K_M.gguf',
+    filename: 'nomic-embed-text-v1.5.Q4_K_M.gguf',
+    sizeEstimate: '80 MB',
+    type: 'embedding',
+  },
+
+  // ── 2. SWEET-SPOT CHAT MODELS (1.5B – 3.8B, Best for Mobile) ──
+  {
+    id: 'qwen-2.5-3b',
+    name: 'Qwen 2.5 3B Instruct (Recommended)',
+    description: 'Best overall mobile model. Superb reasoning, tool calling, and instruction following.',
+    url: 'https://huggingface.co/bartowski/Qwen2.5-3B-Instruct-GGUF/resolve/main/Qwen2.5-3B-Instruct-Q4_K_M.gguf',
+    filename: 'qwen2.5-3b-instruct-q4_k_m.gguf',
+    sizeEstimate: '1.8 GB',
+    type: 'chat',
+  },
+  {
+    id: 'deepseek-r1-1.5b',
+    name: 'DeepSeek-R1 Distill 1.5B',
+    description: 'Distilled reasoning with step-by-step thinking (<think>). Low RAM footprint.',
+    url: 'https://huggingface.co/bartowski/DeepSeek-R1-Distill-Qwen-1.5B-GGUF/resolve/main/DeepSeek-R1-Distill-Qwen-1.5B-Q4_K_M.gguf',
+    filename: 'deepseek-r1-1.5b-q4_k_m.gguf',
+    sizeEstimate: '1.1 GB',
+    type: 'chat',
+  },
+  {
+    id: 'phi-4-mini',
+    name: 'Phi-4 Mini 3.8B Instruct',
+    description: 'Microsoft’s flagship compact model. State-of-the-art math, logic, and reasoning.',
+    url: 'https://huggingface.co/bartowski/microsoft_Phi-4-mini-instruct-GGUF/resolve/main/microsoft_Phi-4-mini-instruct-Q4_K_M.gguf',
+    filename: 'microsoft_phi-4-mini-instruct-q4_k_m.gguf',
     sizeEstimate: '2.4 GB',
     type: 'chat',
   },
   {
-    id: 'mistral-7b',
-    name: 'Mistral 7B v0.3 Instruct (Q4_K_M)',
-    description: 'Highly acclaimed generalist. Balanced, reliable, and excellent for complex reasoning.',
-    url: 'https://huggingface.co/bartowski/Mistral-7B-Instruct-v0.3-GGUF/resolve/main/Mistral-7B-Instruct-v0.3-Q4_K_M.gguf?download=true',
-    filename: 'mistral-7b-v0.3-q4_k_m.gguf',
-    sizeEstimate: '4.4 GB',
+    id: 'llama-3.2-1b',
+    name: 'Llama 3.2 1B Instruct',
+    description: 'Meta’s ultra-lightweight generalist. Lightning fast responses and minimal battery usage.',
+    url: 'https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q4_K_M.gguf',
+    filename: 'llama-3.2-1b-q4_k_m.gguf',
+    sizeEstimate: '770 MB',
+    type: 'chat',
+  },
+  {
+    id: 'qwen-2.5-1.5b',
+    name: 'Qwen 2.5 1.5B Instruct',
+    description: 'Ultra-compact Qwen model. Snappy performance, high multilingual capability.',
+    url: 'https://huggingface.co/bartowski/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/Qwen2.5-1.5B-Instruct-Q4_K_M.gguf',
+    filename: 'qwen2.5-1.5b-instruct-q4_k_m.gguf',
+    sizeEstimate: '940 MB',
     type: 'chat',
   },
   {
     id: 'llama-3.2-3b',
-    name: 'Llama 3.2 3B (Q4_K_M)',
-    description: 'Stronger alternative to the 1B model. Better logical consistency for complex queries.',
-    url: 'https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct-Q4_K_M.gguf?download=true',
+    name: 'Llama 3.2 3B Instruct',
+    description: 'Meta’s 3B generalist. Strong conversational coherence and factual consistency.',
+    url: 'https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct-Q4_K_M.gguf',
     filename: 'llama-3.2-3b-q4_k_m.gguf',
-    sizeEstimate: '2.0 GB',
+    sizeEstimate: '1.9 GB',
+    type: 'chat',
+  },
+
+  // ── 3. FLAGSHIP / HIGH-RAM MODELS (8GB+ RAM Devices Only) ──
+  {
+    id: 'qwen-2.5-7b',
+    name: 'Qwen 2.5 7B Instruct',
+    description: 'High-intelligence reasoning model for flagship devices with 8GB+ RAM.',
+    url: 'https://huggingface.co/bartowski/Qwen2.5-7B-Instruct-GGUF/resolve/main/Qwen2.5-7B-Instruct-Q4_K_M.gguf',
+    filename: 'qwen2.5-7b-instruct-q4_k_m.gguf',
+    sizeEstimate: '4.5 GB',
     type: 'chat',
   },
   {
-    id: 'deepseek-r1-7b',
-    name: 'DeepSeek-R1 7B Distill (Q4_K_M)',
-    description: 'Top-tier reasoning model. Requires high-end hardware (8GB+ RAM).',
-    url: 'https://huggingface.co/bartowski/DeepSeek-R1-Distill-Qwen-7B-GGUF/resolve/main/DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf?download=true',
-    filename: 'deepseek-r1-7b-q4_k_m.gguf',
+    id: 'gemma-4-e4b-it',
+    name: 'Gemma 4 E4B Instruct (Q4_K_M)',
+    description: 'Unsloth quantized Gemma 4 E4B Instruct model in Q4_K_M for experimental multimodal use.',
+    url: 'https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q4_K_M.gguf',
+    filename: 'gemma-4-e4b-it-q4_k_m.gguf',
     sizeEstimate: '4.7 GB',
     type: 'chat',
-  }
+  },
 ];
 
 export default function ModelsScreen() {
@@ -98,17 +131,36 @@ export default function ModelsScreen() {
 
   useFocusEffect(
     useCallback(() => {
-      setActiveModel(brainStore.activeChatModel);
+      const task = InteractionManager.runAfterInteractions(() => {
+        setActiveModel(brainStore.activeChatModel);
+        checkDownloadedModels();
+      });
+      return () => task.cancel();
     }, [])
   );
 
   async function checkDownloadedModels() {
     try {
-      // Modern API
       const dir = new Directory(Paths.document);
       const contents = dir.list();
-      const models = contents.map(item => item.name).filter(file => file.endsWith('.gguf'));
-      setDownloadedFiles(models);
+      const models = contents
+        .filter((item) => {
+          if (!item.name.endsWith('.gguf')) return false;
+          try {
+            const f = new File(Paths.document, item.name);
+            return f.exists && (f.size ?? 0) > 20 * 1024 * 1024;
+          } catch {
+            return false;
+          }
+        })
+        .map((item) => item.name);
+      
+      setDownloadedFiles(prev => {
+        if (prev.length === models.length && prev.every((m, i) => m === models[i])) {
+          return prev;
+        }
+        return models;
+      });
     } catch (e) {
       console.error('Error reading models directory:', e);
     }
@@ -152,80 +204,90 @@ export default function ModelsScreen() {
 
   async function deleteModel(model: ModelInfo) {
     try {
+      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
       const file = new File(Paths.document, model.filename);
       file.delete();
+      if (brainStore.activeChatModel === model.filename) {
+        brainStore.activeChatModel = null;
+        setActiveModel(null);
+      }
       checkDownloadedModels();
     } catch (e) {
       console.error(`Error deleting ${model.name}:`, e);
     }
   }
-  function renderModel({ item }: { item: ModelInfo }) {
-    const isDownloaded = downloadedFiles.includes(item.filename);
-    const downloadProgress = downloading[item.id];
-    const isDownloading = downloadProgress !== undefined;
-    const isActive = activeModel === item.filename;
+  const renderModel = useCallback(
+    ({ item }: { item: ModelInfo }) => {
+      const isDownloaded = downloadedFiles.includes(item.filename);
+      const downloadProgress = downloading[item.id];
+      const isDownloading = downloadProgress !== undefined;
+      const isActive = activeModel === item.filename;
 
-    return (
-      <View style={[styles.modelCard, { backgroundColor: theme.assistantBubble, borderColor: isActive ? theme.accent : theme.border, borderWidth: isActive ? 2 : 1 }]}>
-        <View style={styles.cardHeader}>
-          <Text style={[styles.modelName, { color: theme.text }]}>{item.name}</Text>
-          <View style={[styles.modelBadge, { backgroundColor: item.type === 'embedding' ? theme.accent + '20' : theme.tint + '20' }]}>
-            <Text style={[styles.modelBadgeText, { color: item.type === 'embedding' ? theme.accent : theme.tint }]}>
-              {item.type === 'embedding' ? 'ENCODER' : 'THINKER'}
-            </Text>
-          </View>
-        </View>
-        
-        <Text style={[styles.modelDescription, { color: theme.subtitle }]}>{item.description}</Text>
-        <Text style={[styles.modelSize, { color: theme.subtitle }]}>Size: {item.sizeEstimate}</Text>
-
-        {isDownloading ? (
-          <View style={styles.progressContainer}>
-            <Text style={{ color: theme.text, fontWeight: '600', fontSize: 13 }}>Downloading: {downloadProgress.toFixed(1)}%</Text>
-            <View style={[styles.progressBarBg, { backgroundColor: theme.border }]}>
-              <View style={[styles.progressBarFill, { width: `${downloadProgress}%`, backgroundColor: theme.accent }]} />
+      return (
+        <View style={[styles.modelCard, { backgroundColor: theme.assistantBubble, borderColor: isActive ? theme.accent : theme.border, borderWidth: isActive ? 2 : 1 }]}>
+          <View style={styles.cardHeader}>
+            <Text style={[styles.modelName, { color: theme.text }]}>{item.name}</Text>
+            <View style={[styles.modelBadge, { backgroundColor: item.type === 'embedding' ? theme.accent + '20' : theme.tint + '20' }]}>
+              <Text style={[styles.modelBadgeText, { color: item.type === 'embedding' ? theme.accent : theme.tint }]}>
+                {item.type === 'embedding' ? 'ENCODER' : 'THINKER'}
+              </Text>
             </View>
           </View>
-        ) : (
-          <View style={styles.actionRow}>
-            {isDownloaded ? (
-              <>
-                <View style={styles.downloadedStatus}>
-                  <Text style={[styles.downloadedText, { color: isActive ? theme.accent : theme.success }]}>●</Text>
-                  <Text style={[styles.downloadedText, { color: theme.text, marginLeft: 6 }]}>
-                    {isActive ? 'Active Now' : 'Installed'}
-                  </Text>
-                </View>
-                <View style={{ flexDirection: 'row', gap: 8 }}>
-                  {!isActive && item.type === 'chat' && (
-                    <TouchableOpacity 
-                      style={[styles.button, { backgroundColor: theme.accent }]} 
-                      onPress={() => {
-                        brainStore.activeChatModel = item.filename;
-                        setActiveModel(item.filename);
-                      }}
-                    >
-                      <Text style={styles.buttonText}>Activate</Text>
+          
+          <Text style={[styles.modelDescription, { color: theme.subtitle }]}>{item.description}</Text>
+          <Text style={[styles.modelSize, { color: theme.subtitle }]}>Size: {item.sizeEstimate}</Text>
+
+          {isDownloading ? (
+            <View style={styles.progressContainer}>
+              <Text style={{ color: theme.text, fontWeight: '600', fontSize: 13 }}>Downloading: {downloadProgress.toFixed(1)}%</Text>
+              <View style={[styles.progressBarBg, { backgroundColor: theme.border }]}>
+                <View style={[styles.progressBarFill, { width: `${downloadProgress}%`, backgroundColor: theme.accent }]} />
+              </View>
+            </View>
+          ) : (
+            <View style={styles.actionRow}>
+              {isDownloaded ? (
+                <>
+                  <View style={styles.downloadedStatus}>
+                    <Text style={[styles.downloadedText, { color: isActive ? theme.accent : theme.success }]}>●</Text>
+                    <Text style={[styles.downloadedText, { color: theme.text, marginLeft: 6 }]}>
+                      {isActive ? 'Active Now' : 'Installed'}
+                    </Text>
+                  </View>
+                  <View style={{ flexDirection: 'row', gap: 8 }}>
+                    {!isActive && item.type === 'chat' && (
+                      <TouchableOpacity 
+                        style={[styles.button, { backgroundColor: theme.accent }]} 
+                        onPress={() => {
+                          Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+                          brainStore.activeChatModel = item.filename;
+                          setActiveModel(item.filename);
+                        }}
+                        activeOpacity={0.8}
+                      >
+                        <Text style={[styles.buttonText, { color: theme.userBubbleText }]}>Activate</Text>
+                      </TouchableOpacity>
+                    )}
+                    <TouchableOpacity style={[styles.button, styles.deleteButton, { borderColor: theme.error + '60' }]} onPress={() => deleteModel(item)}>
+                      <Text style={[styles.deleteButtonText, { color: theme.error }]}>Delete</Text>
                     </TouchableOpacity>
-                  )}
-                  <TouchableOpacity style={[styles.button, styles.deleteButton, { borderColor: theme.error + '60' }]} onPress={() => deleteModel(item)}>
-                    <Text style={[styles.deleteButtonText, { color: theme.error }]}>Delete</Text>
-                  </TouchableOpacity>
-                </View>
-              </>
-            ) : (
-              <TouchableOpacity style={[styles.button, { backgroundColor: theme.accent }]} onPress={() => downloadModel(item)}>
-                <Text style={styles.buttonText}>Download Model</Text>
-              </TouchableOpacity>
-            )}
-          </View>
-        )}
-      </View>
-    );
-  }
+                  </View>
+                </>
+              ) : (
+                <TouchableOpacity style={[styles.button, { backgroundColor: theme.accent }]} onPress={() => downloadModel(item)}>
+                  <Text style={[styles.buttonText, { color: theme.userBubbleText }]}>Download Model</Text>
+                </TouchableOpacity>
+              )}
+            </View>
+          )}
+        </View>
+      );
+    },
+    [downloadedFiles, downloading, activeModel, theme]
+  );
 
   return (
-    <SafeAreaView style={[styles.container, { backgroundColor: theme.background }]}>
+    <SafeAreaView style={[styles.container, { backgroundColor: theme.background }]} edges={['top', 'left', 'right']}>
       <View style={styles.header}>
         <Text style={[styles.title, { color: theme.text }]}>Model Center</Text>
         <Text style={[styles.subtitle, { color: theme.subtitle }]}>
@@ -238,6 +300,7 @@ export default function ModelsScreen() {
         keyExtractor={item => item.id}
         renderItem={renderModel}
         contentContainerStyle={styles.list}
+        extraData={[downloadedFiles, downloading, activeModel]}
       />
     </SafeAreaView>
   );

@@ -1,17 +1,34 @@
 import { Colors } from '@/constants/theme';
 import { useColorScheme } from '@/hooks/use-color-scheme';
 import { brainStore } from '@/utils/BrainStore';
+import { getInsertId, readRows } from '@/utils/db';
+import { embedText, runEmbeddingSelfTest } from '@/utils/embeddings';
+import { getSemanticIntent, extractFinancialTargetPerson } from '@/utils/Router';
+import { extractKeywords } from '@/utils/text';
+import {
+  initLedgerTable,
+  recordLedgerFromNote,
+  getPersonBalance,
+  getAllBalances,
+  PersonBalanceSummary,
+  OverallBalanceSummary,
+} from '@/utils/ledgerEngine';
+import { LedgerCard } from '@/components/ui/LedgerCard';
 import { useFocusEffect } from '@react-navigation/native';
 import { Directory, File, Paths } from 'expo-file-system/next';
+import * as Haptics from 'expo-haptics';
 import { initLlama, LlamaContext } from 'llama.rn';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import {
   ActivityIndicator,
   FlatList,
+  InteractionManager,
+  Keyboard,
   KeyboardAvoidingView,
+  Linking,
   Modal,
   Platform,
-  SafeAreaView,
   ScrollView,
   StyleSheet,
   Text,
@@ -28,6 +45,8 @@ interface ChatMessage {
   role: MessageRole;
   content: string;
   timestamp: Date;
+  ledgerPersonSummary?: PersonBalanceSummary | null;
+  ledgerOverallSummary?: OverallBalanceSummary | null;
 }
 
 interface SystemStatus {
@@ -62,106 +81,167 @@ function StatusBadge({ status, label, onPress }: { status: string; label: string
   );
 }
 
-const ANALYTICAL_PROMPT_TEMPLATE = `You are Medha, an analytical RAG assistant. Your goal is to provide precise answers based ONLY on the provided CONTEXT, using strict logic.
-
----
-REASONING FRAMEWORK:
-
-1. ENTITY ISOLATION & SUBJECT PINNING: 
-   - Identify the "Primary Subject" from the user's question. 
-   - Treat notes about other people as background noise. Do NOT merge data between different names.
-
-2. LOGICAL INFERENCE (ACTION -> STATE):
-   - "I gave [Amount] to [Person]" -> [Person] owes you that amount.
-   - "[Person] paid back [Amount]" -> Subtract from their debt.
-   - "I started [Task]" -> The task is currently "In Progress."
-
-3. TOPIC SILOING:
-   - Do NOT substitute nouns for relationship terms. If the note says "Surya," stay with "Surya."
-
-4. CHRONOLOGY:
-   - Always evaluate surviving facts in the order they occurred to calculate the final net state.
-
----
-YOUR TASK:
-Use the **"Strikeout Method"** to process the CONTEXT. Do not skip steps.
-
-<scratchpad>
-1. Primary Subject: [Who/What is this specifically about?]
-2. Raw Facts: [List ALL facts found in the CONTEXT.]
-3. Strikeout (Filtering): [Explicitly list which facts from Step 2 do NOT mention the Primary Subject and REJECT them.]
-4. Bailout Check: [If 0 facts remain after Step 3, write "ABORT" and skip to the final answer.]
-5. Net State Calculation: [Chronologically apply the Action->State rules to the surviving facts to find the final result.]
-</scratchpad>
-
-ANSWER: 
-- If Step 4 says "ABORT", you MUST respond exactly with: "I don't have enough clear information in your notes to answer that."
-- Otherwise, provide a concise, direct answer based ONLY on Step 5. Do NOT explain your math in the final answer.
-
-CONTEXT:
-{CONTEXT}
-
-RECENT CONVERSATION:
-{CHAT_HISTORY}
-
-USER QUESTION:
-{QUESTION}`;
+/**
+ * Checks if a user's input is a casual greeting or conversational pleasantry.
+ * When true, we bypass notes database retrieval to answer instantly and naturally.
+ */
+function isCasualGreeting(query: string): boolean {
+  const clean = query
+    .trim()
+    .toLowerCase()
+    .replace(/[!?.,;:\-_]/g, '')
+    .trim();
+  const greetings = new Set([
+    'hi',
+    'hello',
+    'hey',
+    'hey there',
+    'hi there',
+    'hello there',
+    'hey medha',
+    'hi medha',
+    'hello medha',
+    'good morning',
+    'good afternoon',
+    'good evening',
+    'good day',
+    'good night',
+    'howdy',
+    'hola',
+    'namaste',
+    'how are you',
+    'how are you doing',
+    'how are u',
+    'how r u',
+    'hows it going',
+    "how's it going",
+    'how is it going',
+    'whats up',
+    "what's up",
+    'sup',
+    'yo',
+    'who are you',
+    'what is your name',
+    'what are you',
+    'what can you do',
+    'help',
+    'thanks',
+    'thank you',
+    'ok',
+    'okay',
+    'cool',
+    'awesome',
+    'nice',
+  ]);
+  return greetings.has(clean);
+}
 
 /**
- * Generates a model-specific prompt based on the GGUF filename.
+ * Builds the system instructions for Medha.
+ * - When relevant notes exist, injects them cleanly and directs the model to use them.
+ * - When NO notes exist, does NOT inject an empty "NOTES: No notes" block, allowing
+ *   casual greetings and general questions to be answered naturally and warmly.
+ */
+function buildSystemPrompt(contextStr?: string): string {
+  if (contextStr && contextStr.trim().length > 0) {
+    return `You are Medha, a smart, friendly, and private on-device AI assistant and personal Second Brain.
+
+RELEVANT SAVED NOTES & MEMORIES:
+${contextStr}
+
+GUIDELINES:
+- When the user asks about their personal notes, debts, tasks, or saved records, use the saved memories above as your primary source of truth.
+- For debt or money calculations, calculate balances accurately based on the notes.
+- If the user asks a specific question about a personal memory or note that is NOT mentioned in the notes above, let them know it's not in their notes yet and offer to save it.
+- For greetings, general knowledge, coding, or casual chat, answer naturally, warmly, and helpfully.`;
+  }
+
+  return `You are Medha, a smart, friendly, and private on-device AI assistant and personal Second Brain.
+
+GUIDELINES:
+- Answer questions directly, accurately, and concisely.
+- For greetings and casual conversation, respond warmly, naturally, and helpfully.
+- You have general knowledge across science, tech, math, and everyday topics.
+- If the user specifically asks you to retrieve or check one of their personal saved notes or memories, let them know you don't see any matching notes yet, and offer to save one for them.`;
+}
+
+/**
+ * Generates a model-specific prompt based on the GGUF filename for fallback engines.
  * Supports Llama 3, Gemma 2, Mistral, DeepSeek, and ChatML (Qwen/Phi).
  */
-function formatPrompt(modelName: string, systemTemplate: string, context: string, userQuery: string, history: string): string {
+function formatPrompt(
+  modelName: string,
+  systemPrompt: string,
+  userQuery: string,
+  recentMessages: ChatMessage[]
+): string {
   const name = modelName.toLowerCase();
-  const retrievalContext = context || "No context provided.";
-  
-  // 1. Fill the template placeholders
-  const processedSystem = systemTemplate
-    .replace('{CONTEXT}', retrievalContext)
-    .replace('{CHAT_HISTORY}', history || "No previous messages.")
-    .replace('{QUESTION}', userQuery);
+  const priorTurns = recentMessages
+    .filter((m) => m.role !== 'system' && m.content.trim().length > 0)
+    .slice(-4);
 
-  // 2. Wrap in model-specific tags
-  
-  // Llama 3.x / 3.2 Instruct
-  if (name.includes('llama-3')) {
-    return `<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n${processedSystem}<|eot_id|>` +
-           `<|start_header_id|>assistant<|end_header_id|>\n\n`;
-  }
-
-  // Phi-3 / Phi-3.5
-  if (name.includes('phi-3')) {
-    return `<|user|>\n${processedSystem}<|end|>\n<|assistant|>`;
-  }
-
-  // ChatML (Qwen, DeepSeek-R1 Distill)
+  // ChatML (Qwen 2.5, DeepSeek-R1 Distill)
   if (name.includes('qwen') || name.includes('deepseek')) {
-    return `<|im_start|>system\n${processedSystem}<|im_end|>\n` +
-           `<|im_start|>user\nProvide the response as requested.<|im_end|>\n` +
-           `<|im_start|>assistant\n`;
+    let prompt = `<|im_start|>system\n${systemPrompt}<|im_end|>\n`;
+    for (const turn of priorTurns) {
+      prompt += `<|im_start|>${turn.role === 'assistant' ? 'assistant' : 'user'}\n${turn.content}<|im_end|>\n`;
+    }
+    prompt += `<|im_start|>user\n${userQuery}<|im_end|>\n<|im_start|>assistant\n`;
+    return prompt;
+  }
+
+  // Llama 3.x / 3.2 Instruct
+  if (name.includes('llama-3') || name.includes('llama3')) {
+    let prompt = `<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n${systemPrompt}<|eot_id|>`;
+    for (const turn of priorTurns) {
+      prompt += `<|start_header_id|>${turn.role === 'assistant' ? 'assistant' : 'user'}<|end_header_id|>\n\n${turn.content}<|eot_id|>`;
+    }
+    prompt += `<|start_header_id|>user<|end_header_id|>\n\n${userQuery}<|eot_id|>` +
+              `<|start_header_id|>assistant<|end_header_id|>\n\n`;
+    return prompt;
+  }
+
+  // Phi-3 / Phi-4 Mini
+  if (name.includes('phi-3') || name.includes('phi-4') || name.includes('phi3') || name.includes('phi4')) {
+    let prompt = `<|system|>\n${systemPrompt}<|end|>\n`;
+    for (const turn of priorTurns) {
+      prompt += `<|${turn.role === 'assistant' ? 'assistant' : 'user'}|>\n${turn.content}<|end|>\n`;
+    }
+    prompt += `<|user|>\n${userQuery}<|end|>\n<|assistant|>\n`;
+    return prompt;
   }
 
   // Gemma 2 IT
   if (name.includes('gemma')) {
-    return `<start_of_turn>user\n${processedSystem}<end_of_turn>\n<start_of_turn>model\n`;
+    let prompt = `<start_of_turn>user\n${systemPrompt}\n\n`;
+    for (const turn of priorTurns) {
+      prompt += `${turn.role.toUpperCase()}: ${turn.content}\n\n`;
+    }
+    prompt += `${userQuery}<end_of_turn>\n<start_of_turn>model\n`;
+    return prompt;
   }
 
   // Mistral / Mixtral [Inst]
   if (name.includes('mistral') || name.includes('mixtral') || name.includes('pixtral')) {
-    return `[INST] ${processedSystem} [/INST]`;
+    let prompt = `<s>[INST] ${systemPrompt}\n\n`;
+    for (const turn of priorTurns) {
+      prompt += `${turn.role.toUpperCase()}: ${turn.content}\n\n`;
+    }
+    prompt += `${userQuery} [/INST]`;
+    return prompt;
   }
 
-  // DeepSeek / Alpaca / Generic
-  if (name.includes('alpaca')) {
-    return `### Instruction:\n${processedSystem}\n\n### Response:\n`;
+  // Default fallback (Alpaca style)
+  let prompt = `### System:\n${systemPrompt}\n\n`;
+  for (const turn of priorTurns) {
+    prompt += `### ${turn.role === 'assistant' ? 'Assistant' : 'User'}:\n${turn.content}\n\n`;
   }
-
-  // Default fallback (Modified Alpaca style)
-  return `### System:\n${processedSystem}\n\n### User:\nAnswer the query from the context above.\n\n### Assistant:\n`;
+  prompt += `### User:\n${userQuery}\n\n### Assistant:\n`;
+  return prompt;
 }
 
-// ── Chat Bubble ──
-function ChatBubble({ message, theme }: { message: ChatMessage; theme: typeof Colors.dark }) {
+// ── Chat Bubble (Memoized to prevent re-rendering unchanged messages during streaming) ──
+const ChatBubble = React.memo(function ChatBubble({ message, theme }: { message: ChatMessage; theme: typeof Colors.dark }) {
   const isUser = message.role === 'user';
   const isSystem = message.role === 'system';
 
@@ -186,8 +266,8 @@ function ChatBubble({ message, theme }: { message: ChatMessage; theme: typeof Co
       ]}
     >
       {!isUser && (
-        <View style={[styles.avatar, { backgroundColor: theme.accent }]}>
-          <Text style={styles.avatarText}>M</Text>
+        <View style={[styles.avatar, { backgroundColor: theme.surface, borderColor: theme.border, borderWidth: 1 }]}>
+          <Text style={[styles.avatarText, { color: theme.accent }]}>✦</Text>
         </View>
       )}
       <View
@@ -195,22 +275,30 @@ function ChatBubble({ message, theme }: { message: ChatMessage; theme: typeof Co
           styles.bubble,
           isUser
             ? [styles.userBubble, { backgroundColor: theme.userBubble }]
-            : [styles.assistantBubble, { backgroundColor: theme.assistantBubble }],
+            : [styles.assistantBubble, { backgroundColor: theme.assistantBubble, borderColor: theme.border, borderWidth: 1 }],
         ]}
       >
-        <Text
-          selectable={true}
-          style={[
-            styles.bubbleText,
-            { color: isUser ? '#FFFFFF' : theme.text },
-          ]}
-        >
-          {message.content}
-        </Text>
+        {message.ledgerPersonSummary ? (
+          <LedgerCard personSummary={message.ledgerPersonSummary} />
+        ) : null}
+        {message.ledgerOverallSummary ? (
+          <LedgerCard overallSummary={message.ledgerOverallSummary} />
+        ) : null}
+        {message.content ? (
+          <Text
+            selectable={true}
+            style={[
+              styles.bubbleText,
+              { color: isUser ? theme.userBubbleText : theme.text },
+            ]}
+          >
+            {message.content}
+          </Text>
+        ) : null}
         <Text
           style={[
             styles.timestamp,
-            { color: isUser ? 'rgba(255,255,255,0.7)' : theme.subtitle },
+            { color: isUser ? theme.userBubbleText + 'B0' : theme.subtitle },
           ]}
         >
           {message.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
@@ -218,7 +306,7 @@ function ChatBubble({ message, theme }: { message: ChatMessage; theme: typeof Co
       </View>
     </View>
   );
-}
+});
 
 // ── Main Screen ──
 export default function ChatScreen() {
@@ -265,29 +353,109 @@ export default function ChatScreen() {
     initializeSystems();
   }, []);
 
-  // Refresh model list when screen comes into focus
+  // Auto-scroll messages when keyboard appears so bottom message is never obscured
+  useEffect(() => {
+    const showSub = Keyboard.addListener(
+      Platform.OS === 'ios' ? 'keyboardWillShow' : 'keyboardDidShow',
+      () => {
+        setTimeout(() => {
+          flatListRef.current?.scrollToEnd({ animated: true });
+        }, 50);
+      }
+    );
+    return () => {
+      showSub.remove();
+    };
+  }, []);
+
+  // Refresh model list after tab transitions complete (never block tab animation)
   useFocusEffect(
     useCallback(() => {
-      refreshModelList();
+      const task = InteractionManager.runAfterInteractions(() => {
+        refreshModelList();
+      });
+      return () => task.cancel();
     }, [])
   );
 
+function isEmbeddingFile(filename: string): boolean {
+  const lower = filename.toLowerCase();
+  return lower.includes('nomic') || lower.includes('embed') || lower.includes('minilm') || lower.includes('bge');
+}
+
+/**
+ * Scans the documents directory for GGUF model files that are complete and valid (>20MB).
+ * Ignores empty or interrupted download stubs.
+ */
+function getValidGgufFiles(): string[] {
+  try {
+    const dir = new Directory(Paths.document);
+    const contents = dir.list();
+    return contents
+      .filter((item) => {
+        if (!item.name.endsWith('.gguf')) return false;
+        try {
+          const file = new File(Paths.document, item.name);
+          return file.exists && (file.size ?? 0) > 20 * 1024 * 1024;
+        } catch {
+          return false;
+        }
+      })
+      .map((item) => item.name);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Selects the optimal chat model from available files.
+ * Prefers the active selection, then recommended compact models (like Qwen 2.5 3B),
+ * or the smallest valid model for quick loading.
+ */
+function pickBestChatModel(models: string[]): string | null {
+  if (models.length === 0) return null;
+  if (brainStore.activeChatModel && models.includes(brainStore.activeChatModel)) {
+    return brainStore.activeChatModel;
+  }
+  const preferred = [
+    'qwen2.5-3b-instruct-q4_k_m.gguf',
+    'gemma-2-2b-it-Q4_K_M.gguf',
+    'deepseek-r1-distill-qwen-1.5b-q4_k_m.gguf',
+    'llama-3.2-1b-instruct-q4_k_m.gguf',
+    'llama-3.2-3b-instruct-q4_k_m.gguf',
+  ];
+  for (const pref of preferred) {
+    if (models.includes(pref)) return pref;
+  }
+  const sorted = [...models].sort((a, b) => {
+    try {
+      const sizeA = new File(Paths.document, a).size ?? 0;
+      const sizeB = new File(Paths.document, b).size ?? 0;
+      return sizeA - sizeB;
+    } catch {
+      return 0;
+    }
+  });
+  return sorted[0];
+}
+
   async function refreshModelList() {
     try {
-      const dir = new Directory(Paths.document);
-      const contents = dir.list();
-      const files = contents.map(item => item.name).filter(f => f.endsWith('.gguf'));
-      const chatModels = files.filter(f => !f.includes('MiniLM'));
-      setAvailableModels(chatModels);
+      const files = getValidGgufFiles();
+      const chatModels = files.filter(f => !isEmbeddingFile(f));
       
-      // Force sync with BrainStore: if BrainStore has a different model active, switch to it
-      if (brainStore.activeChatModel && brainStore.activeChatModel !== selectedModel) {
-        setSelectedModel(brainStore.activeChatModel);
-      } else if (!selectedModel && chatModels.length > 0) {
-        // Fallback for first load
-        const fallback = brainStore.activeChatModel || chatModels[0];
-        setSelectedModel(fallback);
-        brainStore.activeChatModel = fallback;
+      // Only trigger re-render if model array actually changed
+      setAvailableModels(prev => {
+        if (prev.length === chatModels.length && prev.every((m, i) => m === chatModels[i])) {
+          return prev;
+        }
+        return chatModels;
+      });
+      
+      const best = pickBestChatModel(chatModels);
+      if (best && best !== selectedModel) {
+        setSelectedModel(best);
+        brainStore.activeChatModel = best;
       }
     } catch (e) {
       console.warn('Silent model list refresh failed', e);
@@ -295,15 +463,13 @@ export default function ChatScreen() {
   }
 
   async function initializeSystems() {
-    addSystemMessage('🧠 Initializing Medha...');
+    addSystemMessage('🧠 Booting Medha...');
 
-    // Test 1: sqlite-vec
+    // 1. sqlite-vec
     await testSqliteVec();
 
-    // Test 2: llama.rn models
+    // 2. llama.rn models
     await loadLlamaContexts();
-
-    addSystemMessage('✨ Medha is ready. Ask me anything about your notes!');
   }
 
   async function testSqliteVec() {
@@ -331,9 +497,21 @@ export default function ChatScreen() {
       const result = db.execute('SELECT vec_version() as version');
       const version = result.rows?.[0]?.version ?? 'unknown';
 
-      // Create the vector table if it doesn't exist
+      // Ensure notes_vec is configured for 768 dimensions (Nomic Embed Text v1.5)
+      try {
+        const tableInfo = db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='notes_vec'");
+        const sql = tableInfo.rows?.[0]?.sql || '';
+        if (sql && !sql.includes('768')) {
+          console.log('[sqlite-vec] Upgrading notes_vec from 384 to 768 dimensions for Nomic Embed...');
+          db.execute('DROP TABLE IF EXISTS notes_vec');
+        }
+      } catch (e) {
+        console.warn('Migration check error:', e);
+      }
+
+      // Create the 768-dim vector table
       db.execute(
-        'CREATE VIRTUAL TABLE IF NOT EXISTS notes_vec USING vec0(embedding float[384])'
+        'CREATE VIRTUAL TABLE IF NOT EXISTS notes_vec USING vec0(embedding float[768])'
       );
 
       // Create notes metadata table
@@ -341,13 +519,20 @@ export default function ChatScreen() {
         CREATE TABLE IF NOT EXISTS notes (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           content TEXT NOT NULL,
+          media_type TEXT DEFAULT 'text',
+          media_uri TEXT,
           created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
       `);
+      try {
+        db.execute("ALTER TABLE notes ADD COLUMN media_type TEXT DEFAULT 'text'");
+      } catch {}
+      try {
+        db.execute("ALTER TABLE notes ADD COLUMN media_uri TEXT");
+      } catch {}
 
-      // ── Hybrid Search: Add FTS5 Virtual Table ──
-      // Note: Reverted FTS5 due to environment module absence.
-      // We now use LIKE-based weighting directly in the vector query for maximum compatibility.
+      // ── Deterministic Ledger Table ──
+      initLedgerTable(db);
 
       setStatus((prev) => ({
         ...prev,
@@ -357,6 +542,8 @@ export default function ChatScreen() {
       dbRef.current = db;
       brainStore.db = db;
       addSystemMessage(`✅ sqlite-vec ${version} loaded. Vector database ready.`);
+
+      // Semantic Router will be initialized after embedding model loads (see loadLlamaContexts)
     } catch (e: any) {
       setStatus((prev) => ({
         ...prev,
@@ -373,13 +560,10 @@ export default function ChatScreen() {
       addSystemMessage('🤖 Scanning downloaded models...');
       setStatus((prev) => ({ ...prev, embeddingModel: 'loading', chatModel: 'loading' }));
 
-      // Find downloaded models
-      const dir = new Directory(Paths.document);
-      const contents = dir.list();
-      const files = contents.map(item => item.name).filter(f => f.endsWith('.gguf'));
-      
-      const embedModelFile = files.find(f => f.includes('MiniLM'));
-      const chatModels = files.filter(f => !f.includes('MiniLM'));
+      // Find valid downloaded models (>20MB)
+      const files = getValidGgufFiles();
+      const embedModelFile = files.find(isEmbeddingFile);
+      const chatModels = files.filter((f) => !isEmbeddingFile(f));
 
       setAvailableModels(chatModels);
 
@@ -389,29 +573,35 @@ export default function ChatScreen() {
         embedContextRef.current = await initLlama({
           model: new File(Paths.document, embedModelFile).uri,
           embedding: true,
+          // Mean pooling collapses per-token vectors into ONE sentence vector
+          pooling_type: 'mean',
+          embd_normalize: 2, // L2-normalize → unit vectors (clean cosine similarity)
+          n_batch: 512,
+          n_ubatch: 512,
+          n_ctx: 2048, // Nomic Embed supports up to 8192 tokens; 2048 is fast & generous for mobile
           use_mlock: true,
         });
         brainStore.embedContext = embedContextRef.current;
-        setStatus(p => ({ ...p, embeddingModel: 'ready', embeddingModelInfo: embedModelFile }));
+        setStatus((p) => ({ ...p, embeddingModel: 'ready', embeddingModelInfo: embedModelFile }));
         addSystemMessage('✅ Vector Engine initialized.');
       } else {
-        setStatus(p => ({ ...p, embeddingModel: 'not_found', embeddingModelInfo: 'Missing MiniLM' }));
+        setStatus((p) => ({ ...p, embeddingModel: 'not_found', embeddingModelInfo: 'Missing Embedding Model' }));
         addSystemMessage('⚠️ Missing embedding model. Please download it in the Models tab.');
       }
 
-      // Auto-select model: check BrainStore first, then fall back to first chat model
-      if (chatModels.length > 0) {
-        const initial = brainStore.activeChatModel || chatModels[0];
+      // Auto-select best chat model
+      const initial = pickBestChatModel(chatModels);
+      if (initial) {
         setSelectedModel(initial);
         brainStore.activeChatModel = initial;
       } else {
-        setStatus(p => ({ ...p, chatModel: 'not_found', chatModelInfo: 'No chat model downloaded' }));
+        setStatus((p) => ({ ...p, chatModel: 'not_found', chatModelInfo: 'No chat model downloaded' }));
         addSystemMessage('⚠️ No chat model found. Please download one in the Models tab.');
       }
     } catch (e: any) {
       console.error('LLAMA.RN MODEL ERROR:', e);
       addSystemMessage(`⚠️ llama.rn Error: ${e.message}`);
-      setStatus(p => ({ ...p, embeddingModel: 'error', chatModel: 'error' }));
+      setStatus((p) => ({ ...p, embeddingModel: 'error', chatModel: 'error' }));
     }
   }
 
@@ -428,14 +618,16 @@ export default function ChatScreen() {
         }
         if (!isMounted) return;
 
-        setStatus(p => ({ ...p, chatModel: 'loading' }));
-        addSystemMessage(`🧠 Loading ${selectedModel} (this may take a moment)...`);
-        
+        setStatus((p) => ({ ...p, chatModel: 'loading' }));
+        addSystemMessage(`🧠 Loading ${selectedModel}...`);
+
         const context = await initLlama({
           model: new File(Paths.document, selectedModel!).uri,
           n_gpu_layers: 99,
           use_mlock: true,
           n_ctx: 2048,
+          n_threads: 4, // Optimal mobile thread count for snappy response without CPU thermal choking
+          n_batch: 512,
         });
 
         if (!isMounted) {
@@ -444,12 +636,13 @@ export default function ChatScreen() {
         }
 
         chatContextRef.current = context;
-        setStatus(p => ({ ...p, chatModel: 'ready', chatModelInfo: selectedModel! }));
-        addSystemMessage(`✅ Thinker model loaded and ready!`);
-      } catch(e: any) {
+        setStatus((p) => ({ ...p, chatModel: 'ready', chatModelInfo: selectedModel! }));
+        addSystemMessage(`✨ Medha is ready with ${selectedModel}! Ask me anything.`);
+      } catch (e: any) {
         if (!isMounted) return;
-        setStatus(p => ({ ...p, chatModel: 'error', chatModelInfo: e.message }));
-        addSystemMessage(`⚠️ Failed to load chat model: ${e.message}`);
+        const errorMessage = e?.message || String(e);
+        setStatus((p) => ({ ...p, chatModel: 'error', chatModelInfo: errorMessage }));
+        addSystemMessage(`⚠️ Failed to load chat model: ${errorMessage}`);
       }
     }
     loadChat();
@@ -471,8 +664,20 @@ export default function ChatScreen() {
     const text = inputText.trim();
     if (!text || isThinking) return;
 
-    if (!embedContextRef.current || !chatContextRef.current || status.sqliteVec !== 'ready') {
-      addSystemMessage("⚠️ Systems are still booting up. Please wait.");
+    if (status.chatModel === 'error') {
+      addSystemMessage(`❌ Chat model failed to load (${status.chatModelInfo}). Please select another model in the Models tab.`);
+      return;
+    }
+    if (status.chatModel === 'loading' || !chatContextRef.current) {
+      addSystemMessage(`⏳ Loading ${selectedModel || 'model'} into memory... Please wait a few seconds.`);
+      return;
+    }
+    if (status.chatModel === 'not_found' || !selectedModel) {
+      addSystemMessage("⚠️ No chat model found. Please download one in the Models tab.");
+      return;
+    }
+    if (status.embeddingModel !== 'ready' || !embedContextRef.current || status.sqliteVec !== 'ready') {
+      addSystemMessage("⏳ Initializing database and memory engine... Please wait a moment.");
       return;
     }
 
@@ -482,135 +687,339 @@ export default function ChatScreen() {
       content: text,
       timestamp: new Date(),
     };
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
     setMessages((prev) => [...prev, userMessage]);
     setInputText('');
     setIsThinking(true);
-    addSystemMessage("🧠 Looking into memories...");
-
     try {
-      // 1. Slash command for adding a note to the Brain
-      if (text.toLowerCase().startsWith('/note ')) {
-        const noteContent = text.slice(6).trim();
-        const embedResult = await embedContextRef.current.embedding(noteContent);
-        
-        const f32Array = new Float32Array(embedResult.embedding);
-        const buffer = new Uint8Array(f32Array.buffer);
-        
-        const insertRes = dbRef.current.execute('INSERT INTO notes (content) VALUES (?)', [noteContent]);
-        let lastId = insertRes.insertId;
-        if (!lastId) {
-          const idRes = dbRef.current.execute('SELECT last_insert_rowid() as id');
-          lastId = idRes.rows?._array?.[0]?.id || idRes.rows?.item?.(0)?.id || idRes.rows?.[0]?.id;
-        }
-        
-        // Insert into Vector Table (Semantic)
-        dbRef.current.execute(`INSERT INTO notes_vec (rowid, embedding) VALUES (${Math.floor(Number(lastId))}, ?)`, [f32Array.buffer]);
-        
-        setMessages((prev) => [
-          ...prev,
-          { id: Date.now().toString(), role: 'assistant', content: '✅ Note saved and vectorized!', timestamp: new Date() }
-        ]);
-        setIsThinking(false);
-        return;
-      }
-
-      // 2. Vectorize and Extract keywords
-      const embedResult = await embedContextRef.current.embedding(text);
-      const f32Array = new Float32Array(embedResult.embedding);
-      const words = text.split(/\s+/).filter(w => w.length > 3);
-      const mainKeyword = words.length > 0 ? words[0] : text;
-
-      // 3. Hybrid Search: Semantic (Vector) + Keyword Weighting (LIKE)
-      const searchRes = dbRef.current.execute(
-        `
-        SELECT 
-          notes.id, 
-          notes.content, 
-          (1.0 / (notes_vec.distance + 0.01)) + (CASE WHEN notes.content LIKE ? OR notes.content LIKE ? THEN 8.0 ELSE 0.0 END) as total_rank
-        FROM notes_vec
-        JOIN notes ON notes.id = notes_vec.rowid
-        WHERE embedding MATCH ? AND k = 10
-        ORDER BY total_rank DESC
-        LIMIT 7
-        `,
-        // We match both capitalized and lowercase for robustness
-        [`%${mainKeyword}%`, `%${mainKeyword.toLowerCase()}%`, f32Array.buffer]
-      );
-
+      const isGreeting = isCasualGreeting(text);
       let contextStr = '';
-      let topNotes: any[] = [];
-      if (searchRes.rows) {
-        if (Array.isArray(searchRes.rows)) topNotes = searchRes.rows;
-        else if (searchRes.rows._array) topNotes = searchRes.rows._array;
-        else if (typeof searchRes.rows.item === 'function') {
-          for (let i = 0; i < searchRes.rows.length; i++) topNotes.push(searchRes.rows.item(i));
+      let personSummary: PersonBalanceSummary | null = null;
+      let overallSummary: OverallBalanceSummary | null = null;
+
+      if (!isGreeting) {
+        // 1. Semantic Router: Keyword-based intent classification (zero-latency, no embeddings)
+        const intent = getSemanticIntent(text);
+        console.log(`[handleSend] Intent classified: ${intent}`);
+        if (intent !== 'GENERAL_CHAT') {
+          addSystemMessage(`🔍 Router: [${intent}]`);
         }
-      }
-      if (topNotes.length > 0) {
-        contextStr = 'RELEVANT NOTES:\n' + topNotes.map((n: any) => `- ${n.content}`).join('\n') + '\n\n';
-        addSystemMessage(`🧠 Insight: Found ${topNotes.length} memories related to your query.`);
-        console.log("🧠 MEDHA RAG DEBUG - Retrieved Context:", contextStr);
+
+        // ── NOTES_ADD: Direct DB insert, bypass LLM entirely ──
+        if (intent === 'NOTES_ADD') {
+          const noteContent = text.replace(/^\/note\s+/i, '')
+            .replace(/^(save this memory|remember that|note for later|write this down|add a note|store this|store that)\s*/gi, '')
+            .trim() || text;
+          
+          console.log(`[handleSend] NOTES_ADD: Saving note: "${noteContent}"`);
+          
+          const f32Array = await embedText(embedContextRef.current, noteContent, 'document');
+
+          const insertRes = dbRef.current.execute('INSERT INTO notes (content, media_type) VALUES (?, ?)', [noteContent, 'text']);
+          const lastId = getInsertId(insertRes, dbRef.current);
+          console.log(`[handleSend] NOTES_ADD: Inserted note id=${lastId}`);
+          if (lastId == null) throw new Error('Could not resolve inserted note id');
+
+          dbRef.current.execute(`INSERT INTO notes_vec (rowid, embedding) VALUES (${Math.floor(Number(lastId))}, ?)`, [f32Array.buffer]);
+          console.log(`[handleSend] NOTES_ADD: Vectorized note id=${lastId}`);
+
+          // Extract and record financial transaction (if present)
+          const recordedTx = await recordLedgerFromNote(dbRef.current, Number(lastId), noteContent, chatContextRef.current);
+          let successMsg = '✅ Memory saved and vectorized!\n(Bypassed LLM to save battery ⚡)';
+          if (recordedTx) {
+            successMsg += `\n📊 Ledger: Recorded ${recordedTx.direction === 'GAVE' ? 'Lent' : 'Received'} ₹${recordedTx.amount} (${recordedTx.original_name})`;
+          }
+          
+          setMessages((prev) => [
+            ...prev,
+            { id: Date.now().toString(), role: 'assistant', content: successMsg, timestamp: new Date() }
+          ]);
+          setIsThinking(false);
+          return;
+        }
+
+        // ── WEB_SEARCH: Extract query via LLM, open browser ──
+        if (intent === 'WEB_SEARCH') {
+          console.log(`[handleSend] WEB_SEARCH: Extracting query from "${text}"`);
+          addSystemMessage("🌐 Preparing web search...");
+          
+          const actionPrompt = `System:\nYou are a Web Search Route API. Extract the exact search query from the user. Output ONLY raw JSON matching this schema: {"query": "search query"}.\nDo not wrap in markdown.\nUser: ${text}\nJSON Output:\n{"query": "`;
+          
+          let generatedText = '{"query": "';
+          
+          const responseId = (Date.now() + 1).toString();
+          setMessages((prev) => [
+            ...prev,
+            { id: responseId, role: 'assistant', content: '⏳ Parsing search query...', timestamp: new Date() },
+          ]);
+
+          await chatContextRef.current.completion(
+            { prompt: actionPrompt, n_predict: 64, temperature: 0.1, stop: ["}"] },
+            (res) => { generatedText += res.token; }
+          );
+          
+          console.log(`[handleSend] WEB_SEARCH: Raw LLM output: "${generatedText}"`);
+          
+          const match = generatedText.match(/"query"\s*:\s*"([^"]*)/);
+          const parsedQuery = match && match[1] ? match[1].trim() : text;
+          
+          console.log(`[handleSend] WEB_SEARCH: Parsed query: "${parsedQuery}"`);
+          
+          setMessages((prev) => 
+            prev.map((msg) => 
+              msg.id === responseId 
+                ? { ...msg, content: `🌐 Opening browser for: "${parsedQuery}"` } 
+                : msg
+            )
+          );
+          
+          Linking.openURL(`https://www.google.com/search?q=${encodeURIComponent(parsedQuery)}`);
+          setIsThinking(false);
+          return;
+        }
+
+        // ── FINANCIAL_QUERY: Deterministic Ledger Math (0ms, 100% accurate) ──
+        if (intent === 'FINANCIAL_QUERY') {
+          console.log(`[handleSend] FINANCIAL_QUERY: Querying ledger for "${text}"`);
+          const targetPerson = extractFinancialTargetPerson(text);
+          let ledgerSummaryStr = '';
+
+          if (targetPerson) {
+            personSummary = getPersonBalance(dbRef.current, targetPerson);
+            if (personSummary) {
+              const owesText =
+                personSummary.netBalance > 0
+                  ? `${personSummary.person} owes you ₹${personSummary.netBalance}. You do not owe ${personSummary.person} anything.`
+                  : personSummary.netBalance < 0
+                    ? `You owe ${personSummary.person} ₹${Math.abs(personSummary.netBalance)}. ${personSummary.person} does not owe you anything.`
+                    : `All dues are completely settled with ${personSummary.person} (balance is ₹0). Neither of you owes anything.`;
+
+              const txListStr = personSummary.transactions
+                .map((t) => `- ${t.direction === 'GAVE' ? 'You lent' : 'You received'} ₹${t.amount}: "${t.note_content || ''}"`)
+                .join('\n');
+
+              ledgerSummaryStr = `DETERMINISTIC FINANCIAL LEDGER FOR ${personSummary.person.toUpperCase()}:
+- Total you lent/paid: ₹${personSummary.totalGave}
+- Total you received: ₹${personSummary.totalReceived}
+- Net Balance: ₹${personSummary.netBalance}
+- EXACT STATUS: ${owesText}
+Transaction History:
+${txListStr}
+
+CRITICAL INSTRUCTION:
+Base your answer STRICTLY on the EXACT numbers above.
+State clearly:
+1. Total you lent/paid: ₹${personSummary.totalGave}
+2. Total you received: ₹${personSummary.totalReceived}
+3. Final Net Balance: ${owesText}
+Never hallucinate or invert who owes whom!`;
+              addSystemMessage(`📊 Ledger: Found exact balance for ${personSummary.person}.`);
+            } else {
+              ledgerSummaryStr = `LEDGER RESULT:
+No financial transactions or debts are recorded for "${targetPerson}".
+Tell the user clearly that they have no recorded money or debt transactions with ${targetPerson} in their saved notes.`;
+              addSystemMessage(`📊 Ledger: No transactions found for ${targetPerson}.`);
+            }
+          } else {
+            overallSummary = getAllBalances(dbRef.current);
+            const creditorsList = overallSummary.creditors.length > 0
+              ? overallSummary.creditors.map((c) => `- ${c.person} owes you ₹${c.amountOwedToUser}`).join('\n')
+              : '- No one owes you money.';
+            const debtorsList = overallSummary.debtors.length > 0
+              ? overallSummary.debtors.map((d) => `- You owe ${d.person} ₹${d.amountUserOwes}`).join('\n')
+              : '- You do not owe anyone money.';
+
+            ledgerSummaryStr = `OVERALL FINANCIAL DEBT SUMMARY:
+People who owe you:
+${creditorsList}
+- Total others owe you: ₹${overallSummary.totalOwedToUser}
+
+People you owe:
+${debtorsList}
+- Total you owe others: ₹${overallSummary.totalUserOwes}
+
+Overall Net Position: ${overallSummary.netBalance >= 0 ? `+₹${overallSummary.netBalance}` : `-₹${Math.abs(overallSummary.netBalance)}`}
+
+CRITICAL INSTRUCTION:
+Answer the user with this exact breakdown. Do not guess any amounts.`;
+            addSystemMessage('📊 Ledger: Retrieved overall debt summary.');
+          }
+
+          contextStr = ledgerSummaryStr;
+        } else {
+          // ── RAG PIPELINE: Runs for other queries and memories ──
+          console.log(`[handleSend] RAG Pipeline starting for intent: ${intent}`);
+          console.log(`[handleSend] Embedding query: "${text}"`);
+          const f32Array = await embedText(embedContextRef.current, text, 'query');
+          console.log(`[handleSend] Embedding done. Vector length: ${f32Array.length}, first val: ${f32Array[0]}`);
+          
+          const keywords = extractKeywords(text);
+          console.log(`[handleSend] Keywords for boost: [${keywords.join(', ')}]`);
+
+          const boostClause =
+            keywords.length > 0
+              ? `(CASE WHEN ${keywords.map(() => 'notes.content LIKE ?').join(' OR ')} THEN 5.0 ELSE 0.0 END)`
+              : '0.0';
+          const searchRes = dbRef.current.execute(
+            `
+            SELECT
+              notes.id,
+              notes.content,
+              (1.0 / (notes_vec.distance + 0.01)) + ${boostClause} as total_rank
+            FROM notes_vec
+            JOIN notes ON notes.id = notes_vec.rowid
+            WHERE embedding MATCH ? AND k = 8
+            ORDER BY total_rank DESC
+            LIMIT 5
+            `,
+            [...keywords.map((k) => `%${k}%`), f32Array.buffer]
+          );
+
+          const topNotes: any[] = readRows(searchRes);
+
+          console.log(`[handleSend] Search returned ${topNotes.length} notes`);
+          topNotes.forEach((n: any, i: number) => {
+            console.log(`[handleSend]   Note ${i + 1}: [rank=${n.total_rank?.toFixed(2)}] "${n.content?.substring(0, 80)}"`);
+          });
+
+          const topRank = topNotes[0]?.total_rank ?? 0;
+          const relevantNotes = topNotes.filter((n: any) => (n.total_rank ?? 0) >= topRank * 0.5);
+
+          if (relevantNotes.length > 0) {
+            contextStr = relevantNotes.map((n: any) => `- ${n.content}`).join('\n');
+            console.log(`[handleSend] Injecting ${relevantNotes.length}/${topNotes.length} notes as context.`);
+            addSystemMessage(
+              `🧠 Found ${relevantNotes.length} relevant ${relevantNotes.length === 1 ? 'memory' : 'memories'}.`
+            );
+          } else if (intent === 'NOTES_SEARCH') {
+            console.log(`[handleSend] No notes found for search query.`);
+            addSystemMessage('🧠 No specific memories found for this query.');
+          }
+        }
       } else {
-        addSystemMessage("🧠 Insight: No specific memories found for this query.");
-        console.log("🧠 MEDHA RAG DEBUG - No relevant notes found for query:", text);
+        console.log(`[handleSend] Casual greeting detected ("${text}"). Skipping notes retrieval.`);
       }
 
-      // 4. Construct Chat History for context pinning (Last 4 messages)
-      const historyStr = messages
-        .filter(m => m.role !== 'system')
-        .slice(-4)
-        .map(m => `${m.role.toUpperCase()}: ${m.content}`)
-        .join('\n');
-
-      // 5. Construct Prompt Dynamically
-      const finalPrompt = formatPrompt(selectedModel || '', ANALYTICAL_PROMPT_TEMPLATE, contextStr, text, historyStr);
+      // 5. Build the chat and run completion.
+      const chatCtx = chatContextRef.current;
+      if (!chatCtx) throw new Error('Chat model not loaded');
 
       const responseId = (Date.now() + 1).toString();
       setMessages((prev) => [
         ...prev,
-        { id: responseId, role: 'assistant', content: '', timestamp: new Date() },
+        {
+          id: responseId,
+          role: 'assistant',
+          content: '',
+          timestamp: new Date(),
+          ledgerPersonSummary: personSummary,
+          ledgerOverallSummary: overallSummary,
+        },
       ]);
 
-      // 5. Stream Tokens
-      await chatContextRef.current.completion(
-        { prompt: finalPrompt, n_predict: 512, temperature: 0.1 },
-        (res) => {
-          setMessages((prev) => 
-            prev.map((msg) => 
-              msg.id === responseId ? { ...msg, content: msg.content + res.token } : msg
-            )
-          );
+      // High-performance token buffer: Flushes to state every ~50ms instead of 30+ times/sec
+      let accumulatedContent = '';
+      let lastFlushTime = 0;
+      let flushTimeout: any = null;
+
+      const flushToState = (isFinal = false) => {
+        if (flushTimeout) {
+          clearTimeout(flushTimeout);
+          flushTimeout = null;
         }
-      );
+        setMessages((prev) =>
+          prev.map((msg) =>
+            msg.id === responseId
+              ? {
+                  ...msg,
+                  content: accumulatedContent,
+                  ledgerPersonSummary: personSummary,
+                  ledgerOverallSummary: overallSummary,
+                }
+              : msg
+          )
+        );
+        if (isFinal) {
+          setTimeout(() => flatListRef.current?.scrollToEnd({ animated: true }), 50);
+        } else {
+          flatListRef.current?.scrollToEnd({ animated: false });
+        }
+      };
+
+      const onToken = (res: { token: string }) => {
+        accumulatedContent += res.token;
+        const now = Date.now();
+        if (now - lastFlushTime > 50) {
+          lastFlushTime = now;
+          flushToState(false);
+        } else if (!flushTimeout) {
+          flushTimeout = setTimeout(() => {
+            lastFlushTime = Date.now();
+            flushToState(false);
+          }, 50);
+        }
+      };
+
+      let useJinja = false;
+      try { useJinja = chatCtx.isJinjaSupported(); } catch { useJinja = false; }
+      console.log(`[handleSend] Context injected: ${contextStr.length > 0 ? 'YES' : 'NO'} (${contextStr.length} chars)`);
+      console.log(`[handleSend] Chat formatting: ${useJinja ? 'jinja (model template)' : 'formatPrompt fallback'}`);
+      console.log(`[handleSend] Starting LLM completion...`);
+
+      const systemContent = buildSystemPrompt(contextStr);
+
+      // 6. Stream Tokens
+      if (useJinja) {
+        const priorTurns = messages
+          .filter((m) => m.role !== 'system' && m.content.trim().length > 0)
+          .slice(-6)
+          .map((m) => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: m.content }));
+        await chatCtx.completion(
+          {
+            messages: [
+              { role: 'system', content: systemContent },
+              ...priorTurns,
+              { role: 'user', content: text },
+            ],
+            jinja: true,
+            n_predict: 512,
+            temperature: 0.6,
+          },
+          onToken
+        );
+      } else {
+        const finalPrompt = formatPrompt(selectedModel || '', systemContent, text, messages);
+        console.log(`[handleSend] Fallback prompt length: ${finalPrompt.length} chars`);
+        await chatCtx.completion(
+          { prompt: finalPrompt, n_predict: 512, temperature: 0.6 },
+          onToken
+        );
+      }
+      flushToState(true);
+      console.log(`[handleSend] LLM completion finished.`);
 
     } catch (e: any) {
-      console.error('Inference Error:', e);
+      console.error('[handleSend] ERROR:', e);
       addSystemMessage(`❌ Generation error: ${e.message}`);
     } finally {
       setIsThinking(false);
     }
   }
 
-  // ── Auto-scroll to bottom ──
-  useEffect(() => {
-    if (messages.length > 0) {
-      setTimeout(() => {
-        flatListRef.current?.scrollToEnd({ animated: true });
-      }, 100);
-    }
-  }, [messages]);
-
   // ── Render ──
   return (
-    <SafeAreaView style={[styles.container, { backgroundColor: theme.background }]}>
+    <SafeAreaView style={[styles.container, { backgroundColor: theme.background }]} edges={['top', 'left', 'right']}>
       {/* Header */}
       <View style={[styles.header, { borderBottomColor: theme.border }]}>
         <View style={styles.headerLeft}>
           <View style={[styles.headerIcon, { backgroundColor: theme.accent }]}>
-            <Text style={styles.headerIconText}>M</Text>
+            <Text style={[styles.headerIconText, { color: theme.userBubbleText }]}>M</Text>
           </View>
           <View>
-            <Text style={[styles.headerTitle, { color: theme.text }]}>Medha</Text>
+            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+              <Text style={[styles.headerTitle, { color: theme.text }]}>Medha</Text>
+              <Text style={{ fontSize: 13, color: theme.accent }}>✦</Text>
+            </View>
             <Text style={[styles.headerSubtitle, { color: theme.subtitle }]}>
               Your Second Brain
             </Text>
@@ -658,16 +1067,58 @@ export default function ChatScreen() {
           renderItem={({ item }) => <ChatBubble message={item} theme={theme} />}
           contentContainerStyle={styles.messageList}
           showsVerticalScrollIndicator={false}
+          keyboardDismissMode="on-drag"
+          keyboardShouldPersistTaps="handled"
+          onContentSizeChange={() => {
+            flatListRef.current?.scrollToEnd({ animated: true });
+          }}
+          onLayout={() => {
+            flatListRef.current?.scrollToEnd({ animated: false });
+          }}
           ListEmptyComponent={
             <View style={styles.emptyState}>
-              <Text style={[styles.emptyIcon]}>🧠</Text>
+              <View style={[styles.emptyIconBg, { backgroundColor: theme.accent + '20', borderColor: theme.accent + '40', borderWidth: 1 }]}>
+                <Text style={[styles.emptyIcon, { color: theme.accent }]}>✦</Text>
+              </View>
               <Text style={[styles.emptyTitle, { color: theme.text }]}>
-                Welcome to Medha
+                Medha Brain
               </Text>
               <Text style={[styles.emptySubtitle, { color: theme.subtitle }]}>
-                Your private, on-device AI assistant.{'\n'}
-                Initializing systems...
+                Your private, on-device AI assistant connected to your memories.
               </Text>
+
+              <View style={styles.quickPrompts}>
+                <TouchableOpacity
+                  style={[styles.promptChip, { backgroundColor: theme.surface, borderColor: theme.border }]}
+                  onPress={() => {
+                    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+                    setInputText("What memories do I have saved?");
+                  }}
+                  activeOpacity={0.7}
+                >
+                  <Text style={[styles.promptChipText, { color: theme.text }]}>📝 What memories do I have saved?</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[styles.promptChip, { backgroundColor: theme.surface, borderColor: theme.border }]}
+                  onPress={() => {
+                    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+                    setInputText("Summarize what I need to remember");
+                  }}
+                  activeOpacity={0.7}
+                >
+                  <Text style={[styles.promptChipText, { color: theme.text }]}>💡 Summarize what I need to remember</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[styles.promptChip, { backgroundColor: theme.surface, borderColor: theme.border }]}
+                  onPress={() => {
+                    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+                    setInputText("/note Medha is my private second brain");
+                  }}
+                  activeOpacity={0.7}
+                >
+                  <Text style={[styles.promptChipText, { color: theme.text }]}>⚡ /note Save a new memory</Text>
+                </TouchableOpacity>
+              </View>
             </View>
           }
         />
@@ -682,7 +1133,7 @@ export default function ChatScreen() {
           </View>
         )}
 
-        <View style={[styles.inputContainer, { borderTopColor: theme.border }]}>
+        <View style={[styles.inputContainer, { borderTopColor: theme.border, backgroundColor: theme.background }]}>
           <TextInput
             style={[
               styles.input,
@@ -694,21 +1145,36 @@ export default function ChatScreen() {
             ]}
             value={inputText}
             onChangeText={setInputText}
-            placeholder="Ask Medha anything..."
+            placeholder={
+              status.chatModel === 'loading'
+                ? `Loading ${selectedModel?.replace(/\.gguf$/i, '') || 'model'}...`
+                : status.chatModel === 'error'
+                  ? 'Model failed to load. Pick another in Models tab.'
+                  : 'Ask Medha anything...'
+            }
             placeholderTextColor={theme.subtitle}
             multiline
             maxLength={2000}
             onSubmitEditing={handleSend}
             blurOnSubmit={false}
+            onFocus={() => {
+              setTimeout(() => {
+                flatListRef.current?.scrollToEnd({ animated: true });
+              }, 80);
+            }}
           />
           <TouchableOpacity
             onPress={handleSend}
-            disabled={!inputText.trim() || isThinking}
+            disabled={!inputText.trim() || isThinking || status.chatModel === 'loading'}
             style={[
               styles.sendButton,
               {
                 backgroundColor:
-                  inputText.trim() && !isThinking ? theme.accent : theme.border,
+                  inputText.trim() && !isThinking && status.chatModel !== 'loading'
+                    ? theme.accent
+                    : theme.surface,
+                borderColor: theme.border,
+                borderWidth: 1,
               },
             ]}
           >
@@ -717,7 +1183,7 @@ export default function ChatScreen() {
                 styles.sendButtonText,
                 {
                   color:
-                    inputText.trim() && !isThinking ? '#FFFFFF' : theme.subtitle,
+                    inputText.trim() && !isThinking ? theme.userBubbleText : theme.subtitle,
                 },
               ]}
             >
@@ -944,23 +1410,51 @@ const styles = StyleSheet.create({
     flex: 1,
     alignItems: 'center',
     justifyContent: 'center',
-    paddingTop: 140,
+    paddingTop: 40,
+    paddingBottom: 40,
+  },
+  emptyIconBg: {
+    width: 72,
+    height: 72,
+    borderRadius: 36,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: 16,
   },
   emptyIcon: {
-    fontSize: 64,
-    marginBottom: 20,
+    fontSize: 36,
   },
   emptyTitle: {
-    fontSize: 28,
+    fontSize: 24,
     fontWeight: '800',
-    marginBottom: 10,
+    marginBottom: 8,
     letterSpacing: -0.5,
   },
   emptySubtitle: {
-    fontSize: 15,
+    fontSize: 14,
     textAlign: 'center',
-    lineHeight: 24,
+    lineHeight: 20,
     maxWidth: '80%',
+  },
+  quickPrompts: {
+    marginTop: 24,
+    width: '90%',
+    gap: 10,
+  },
+  promptChip: {
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    borderRadius: 16,
+    borderWidth: 1,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.04,
+    shadowRadius: 3,
+    elevation: 1,
+  },
+  promptChipText: {
+    fontSize: 14,
+    fontWeight: '600',
   },
 
   // Thinking

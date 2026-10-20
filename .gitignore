@@ -44,3 +44,11 @@ app-example
 
 # AI model files (too large for git)
 *.tflite
+*.gguf
+
+# Local SQLite databases (user data — never commit)
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3

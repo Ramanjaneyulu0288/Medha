@@ -1,50 +1,39 @@
-# Welcome to your Expo app 👋
+# Medha — your private, on-device AI
 
-This is an [Expo](https://expo.dev) project created with [`create-expo-app`](https://www.npmjs.com/package/create-expo-app).
+Medha is a **fully on-device AI assistant** built with Expo / React Native. It chats,
+remembers your notes, and (over time) performs tasks and summarizes — with **all inference
+running locally on your phone**. No cloud, no accounts, no data leaving the device.
 
-## Get started
+**How it works**
+- **LLM + embeddings:** [`llama.rn`](https://github.com/mybigday/llama.rn) (llama.cpp) running GGUF models you download in-app.
+- **Memory (RAG):** notes are embedded into vectors and searched with `sqlite-vec`.
+- **Privacy:** your data stays on-device; encryption-at-rest is on the roadmap.
 
-1. Install dependencies
-
-   ```bash
-   npm install
-   ```
-
-2. Start the app
-
-   ```bash
-   npx expo start
-   ```
-
-In the output, you'll find options to open the app in a
-
-- [development build](https://docs.expo.dev/develop/development-builds/introduction/)
-- [Android emulator](https://docs.expo.dev/workflow/android-studio-emulator/)
-- [iOS simulator](https://docs.expo.dev/workflow/ios-simulator/)
-- [Expo Go](https://expo.dev/go), a limited sandbox for trying out app development with Expo
-
-You can start developing by editing the files inside the **app** directory. This project uses [file-based routing](https://docs.expo.dev/router/introduction).
-
-## Get a fresh project
-
-When you're ready, run:
+## Run it
 
 ```bash
-npm run reset-project
+npm install            # also patches sqlite-vec into the native SQLite module (postinstall)
+npx expo run:android   # or: npx expo run:ios   (a dev build is required — not Expo Go)
 ```
 
-This command will move the starter code to the **app-example** directory and create a blank **app** directory where you can start developing.
+Then open the **Models** tab to download an embedding model (all-MiniLM) and a chat model,
+and start chatting.
 
-## Learn more
+## Roadmap & design
 
-To learn more about developing your project with Expo, look at the following resources:
+The full build plan, model/runtime research, and the phase-by-phase roadmap live in
+**[PLAN.md](PLAN.md)**. Deeper architecture notes are in
+[RAG_TECHNICAL_GUIDE.md](RAG_TECHNICAL_GUIDE.md).
 
-- [Expo documentation](https://docs.expo.dev/): Learn fundamentals, or go into advanced topics with our [guides](https://docs.expo.dev/guides).
-- [Learn Expo tutorial](https://docs.expo.dev/tutorial/introduction/): Follow a step-by-step tutorial where you'll create a project that runs on Android, iOS, and the web.
+## Project layout
 
-## Join the community
-
-Join our community of developers creating universal apps.
-
-- [Expo on GitHub](https://github.com/expo/expo): View our open source platform and contribute.
-- [Discord community](https://chat.expo.dev): Chat with Expo users and ask questions.
+| Path | What |
+|---|---|
+| `app/(tabs)/index.tsx` | Chat screen + RAG pipeline + model init |
+| `app/(tabs)/notes.tsx` | Notes ("memories") CRUD + re-indexing |
+| `app/(tabs)/models.tsx` | Download / activate local models |
+| `utils/embeddings.ts` | Embedding + cosine-similarity helpers + self-test |
+| `utils/db.ts` | SQLite result-row normalization helpers |
+| `utils/Router.ts` | Keyword intent fast-path router |
+| `utils/BrainStore.ts` | Singleton holding the loaded contexts + db |
+| `scripts/patch-sqlite-vec.sh` | Statically links `sqlite-vec` into the native SQLite module |
