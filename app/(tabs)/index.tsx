@@ -615,6 +615,7 @@ function pickBestChatModel(models: string[]): string | null {
         if (chatContextRef.current) {
           await chatContextRef.current.release();
           chatContextRef.current = null;
+          brainStore.chatContext = null;
         }
         if (!isMounted) return;
 
@@ -636,6 +637,7 @@ function pickBestChatModel(models: string[]): string | null {
         }
 
         chatContextRef.current = context;
+        brainStore.chatContext = context;
         setStatus((p) => ({ ...p, chatModel: 'ready', chatModelInfo: selectedModel! }));
         addSystemMessage(`✨ Medha is ready with ${selectedModel}! Ask me anything.`);
       } catch (e: any) {
@@ -691,6 +693,7 @@ function pickBestChatModel(models: string[]): string | null {
     setMessages((prev) => [...prev, userMessage]);
     setInputText('');
     setIsThinking(true);
+    brainStore.isGenerating = true;
     try {
       const isGreeting = isCasualGreeting(text);
       let contextStr = '';
@@ -734,6 +737,7 @@ function pickBestChatModel(models: string[]): string | null {
             ...prev,
             { id: Date.now().toString(), role: 'assistant', content: successMsg, timestamp: new Date() }
           ]);
+          brainStore.isGenerating = false;
           setIsThinking(false);
           return;
         }
@@ -774,6 +778,7 @@ function pickBestChatModel(models: string[]): string | null {
           );
           
           Linking.openURL(`https://www.google.com/search?q=${encodeURIComponent(parsedQuery)}`);
+          brainStore.isGenerating = false;
           setIsThinking(false);
           return;
         }
@@ -1002,6 +1007,7 @@ Answer the user with this exact breakdown. Do not guess any amounts.`;
       console.error('[handleSend] ERROR:', e);
       addSystemMessage(`❌ Generation error: ${e.message}`);
     } finally {
+      brainStore.isGenerating = false;
       setIsThinking(false);
     }
   }

@@ -1,5 +1,6 @@
 import { readRows } from './db';
 import { LlamaContext } from 'llama.rn';
+import { brainStore } from './BrainStore';
 
 export type TransactionDirection = 'GAVE' | 'RECEIVED';
 
@@ -11,6 +12,9 @@ export interface LedgerTransaction {
   direction: TransactionDirection;
   amount: number;
   currency: string;
+  category?: string;
+  status?: string;
+  raw_json?: string;
   created_at?: string;
   note_content?: string;
 }
@@ -49,13 +53,22 @@ export function initLedgerTable(db: any): void {
         direction TEXT NOT NULL,
         amount REAL NOT NULL,
         currency TEXT DEFAULT 'INR',
+        category TEXT DEFAULT 'general',
+        status TEXT DEFAULT 'unsettled',
+        raw_json TEXT,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (note_id) REFERENCES notes(id) ON DELETE CASCADE
       );
     `);
+    
+    // Migrations for existing databases
+    try { db.execute("ALTER TABLE ledger ADD COLUMN category TEXT DEFAULT 'general'"); } catch {}
+    try { db.execute("ALTER TABLE ledger ADD COLUMN status TEXT DEFAULT 'unsettled'"); } catch {}
+    try { db.execute("ALTER TABLE ledger ADD COLUMN raw_json TEXT"); } catch {}
+
     db.execute('CREATE INDEX IF NOT EXISTS idx_ledger_person ON ledger(person);');
     db.execute('CREATE INDEX IF NOT EXISTS idx_ledger_note_id ON ledger(note_id);');
-    console.log('[ledgerEngine] Table initialized successfully.');
+    console.log('[ledgerEngine] Table initialized and migrated successfully.');
   } catch (e) {
     console.error('[ledgerEngine] Failed to init ledger table:', e);
   }
@@ -150,17 +163,21 @@ export function extractTransactionRegex(text: string): Omit<LedgerTransaction, '
   const amtRegex = `(?:[₹$]?\\s*([\\d.]+(?:\\s*k|\\s*lakh|\\s*l)?)\\s*(?:rs\\.?|rupees?|bucks?|inr)?|(?:a\\s+)?(?:hundred|thousand|fifty|twenty|thirty|forty))`;
   const nameRegex = `([a-zA-Z]+(?:\\s+[a-zA-Z]+)?)`;
 
-  // Pattern A: User GAVE money to Person (Direction = GAVE)
+  // Pattern A: User GAVE money to Person (Direction = GAVE / Person owes User)
   // - "I gave Suresh 50 rupees", "gave 50 to Suresh", "lent Suresh 100", "I lent Suresh 100"
   // - "paid Suresh back 100", "paid 100 for Suresh"
   // - "Suresh borrowed 500 from me" (Suresh borrowed = User gave!)
+  // - "Suresh owes me 500", "Suresh has to pay me 200"
   const gavePatterns: { regex: RegExp; nameIdx: number; amtIdx: number }[] = [
     { regex: new RegExp(`(?:i\\s+)?(?:gave|transferred|sent)\\s+${nameRegex}\\s+${amtRegex}`, 'i'), nameIdx: 1, amtIdx: 2 },
     { regex: new RegExp(`(?:i\\s+)?(?:gave|transferred|sent)\\s+${amtRegex}\\s+to\\s+${nameRegex}`, 'i'), nameIdx: 2, amtIdx: 1 },
     { regex: new RegExp(`(?:i\\s+)?lent\\s+${nameRegex}\\s+${amtRegex}`, 'i'), nameIdx: 1, amtIdx: 2 },
+    { regex: new RegExp(`(?:i\\s+)?lent\\s+${amtRegex}\\s+to\\s+${nameRegex}`, 'i'), nameIdx: 2, amtIdx: 1 },
     { regex: new RegExp(`(?:i\\s+)?paid\\s+${nameRegex}\\s+(?:back\\s+)?${amtRegex}`, 'i'), nameIdx: 1, amtIdx: 2 },
     { regex: new RegExp(`(?:i\\s+)?paid\\s+${amtRegex}\\s+(?:to|for|on\\s+behalf\\s+of)\\s+${nameRegex}`, 'i'), nameIdx: 2, amtIdx: 1 },
     { regex: new RegExp(`${nameRegex}\\s+(?:borrowed|took)\\s+${amtRegex}\\s+from\\s+me`, 'i'), nameIdx: 1, amtIdx: 2 },
+    { regex: new RegExp(`${nameRegex}\\s+owes\\s+me\\s+${amtRegex}`, 'i'), nameIdx: 1, amtIdx: 2 },
+    { regex: new RegExp(`${nameRegex}\\s+(?:has\\s+to|needs\\s+to)\\s+(?:pay|give|return)\\s+(?:to\\s+)?me\\s+${amtRegex}`, 'i'), nameIdx: 1, amtIdx: 2 },
   ];
 
   for (const { regex, nameIdx, amtIdx } of gavePatterns) {
@@ -175,21 +192,28 @@ export function extractTransactionRegex(text: string): Omit<LedgerTransaction, '
           direction: 'GAVE',
           amount,
           currency: 'INR',
+          category: 'loan',
+          status: 'unsettled',
         };
       }
     }
   }
 
-  // Pattern B: User RECEIVED money from Person (Direction = RECEIVED)
+  // Pattern B: User RECEIVED money from Person (Direction = RECEIVED / User owes Person)
   // - "Suresh gave me 100 rupees", "received 100 from Suresh", "Suresh returned 50"
   // - "Suresh paid me back 100", "Suresh repaid me 100"
   // - "Suresh lent me 500" (Suresh lent me = User received!)
   // - "I borrowed 100 from Suresh" (User borrowed = User received!)
+  // - "I owe Ramesh 50", "I have to pay Ramesh 50"
   const receivedPatterns: { regex: RegExp; nameIdx: number; amtIdx: number }[] = [
     { regex: new RegExp(`${nameRegex}\\s+(?:gave\\s+me|paid\\s+me(?:\\s+back)?|returned|sent\\s+me|repaid\\s+me)\\s+${amtRegex}`, 'i'), nameIdx: 1, amtIdx: 2 },
     { regex: new RegExp(`${nameRegex}\\s+lent\\s+me\\s+${amtRegex}`, 'i'), nameIdx: 1, amtIdx: 2 },
+    { regex: new RegExp(`${nameRegex}\\s+lent\\s+${amtRegex}\\s+to\\s+me`, 'i'), nameIdx: 1, amtIdx: 2 },
     { regex: new RegExp(`(?:i\\s+)?(?:received|got|collected|borrowed)\\s+${amtRegex}\\s+from\\s+${nameRegex}`, 'i'), nameIdx: 2, amtIdx: 1 },
     { regex: new RegExp(`(?:i\\s+)?borrowed\\s+${amtRegex}\\s+from\\s+${nameRegex}`, 'i'), nameIdx: 2, amtIdx: 1 },
+    { regex: new RegExp(`(?:i\\s+)?owe\\s+${nameRegex}\\s+${amtRegex}`, 'i'), nameIdx: 1, amtIdx: 2 },
+    { regex: new RegExp(`(?:i\\s+)?(?:have\\s+to|need\\s+to)\\s+(?:pay|give|return)\\s+${nameRegex}\\s+${amtRegex}`, 'i'), nameIdx: 1, amtIdx: 2 },
+    { regex: new RegExp(`(?:i\\s+)?(?:have\\s+to|need\\s+to)\\s+(?:pay|give|return)\\s+${amtRegex}\\s+to\\s+${nameRegex}`, 'i'), nameIdx: 2, amtIdx: 1 },
   ];
 
   for (const { regex, nameIdx, amtIdx } of receivedPatterns) {
@@ -204,6 +228,8 @@ export function extractTransactionRegex(text: string): Omit<LedgerTransaction, '
           direction: 'RECEIVED',
           amount,
           currency: 'INR',
+          category: /\bowe\b/i.test(clean) ? 'debt' : 'repayment',
+          status: 'unsettled',
         };
       }
     }
@@ -215,23 +241,34 @@ export function extractTransactionRegex(text: string): Omit<LedgerTransaction, '
 /**
  * Tier 2: LLM-powered Micro Extractor.
  * Fallback for conversational, unstructured sentences when regex fails.
+ * Runs in parallel background worker.
  */
 export async function extractTransactionLLM(
   text: string,
   chatCtx: LlamaContext
 ): Promise<Omit<LedgerTransaction, 'note_id'> | null> {
+  // Prevent collision with active chat generation on mobile
+  if (brainStore.isGenerating) {
+    console.log('[ledgerEngine] Skipping LLM extraction: Chat model is actively generating.');
+    return null;
+  }
+
   try {
     const prompt = `<|im_start|>system
-You are a financial entity extraction engine. Determine if the note describes money given, lent, borrowed, or received between the User and another single named person.
-If the User GAVE or PAID money for someone -> direction = "GAVE"
-If the User RECEIVED or BORROWED money from someone -> direction = "RECEIVED"
+You are a financial entity extraction engine. Determine if the note describes money given, lent, borrowed, owed, or received between the User and another single named person.
+If the User GAVE or PAID money for someone, or someone OWES money to User -> direction = "GAVE"
+If the User RECEIVED or BORROWED money from someone, or the User OWES someone -> direction = "RECEIVED"
 Always normalize currency to INR.
-Output ONLY a JSON object: {"person": string, "amount": number, "direction": "GAVE"|"RECEIVED", "currency": "INR"}
+Output ONLY a JSON object: {"person": string, "amount": number, "direction": "GAVE"|"RECEIVED", "category": "debt"|"loan"|"split"|"general", "currency": "INR"}
 If no financial transaction or multiple people are mentioned, output: {"is_financial": false}<|im_end|>
 <|im_start|>user
 Note: "Suresh gave me a hundred bucks"<|im_end|>
 <|im_start|>assistant
-{"person": "Suresh", "amount": 100, "direction": "RECEIVED", "currency": "INR"}<|im_end|>
+{"person": "Suresh", "amount": 100, "direction": "RECEIVED", "category": "loan", "currency": "INR"}<|im_end|>
+<|im_start|>user
+Note: "I owe Ramesh 50"<|im_end|>
+<|im_start|>assistant
+{"person": "Ramesh", "amount": 50, "direction": "RECEIVED", "category": "debt", "currency": "INR"}<|im_end|>
 <|im_start|>user
 Note: "${text}"<|im_end|>
 <|im_start|>assistant
@@ -261,6 +298,9 @@ Note: "${text}"<|im_end|>
         direction,
         amount,
         currency: 'INR',
+        category: parsed.category || (direction === 'GAVE' ? 'loan' : 'debt'),
+        status: 'unsettled',
+        raw_json: JSON.stringify(parsed),
       };
     }
     return null;
@@ -277,7 +317,7 @@ export async function extractTransaction(
   text: string,
   chatCtx?: LlamaContext | null
 ): Promise<Omit<LedgerTransaction, 'note_id'> | null> {
-  // 1. Try fast regex
+  // 1. Try fast regex (0ms)
   const regexResult = extractTransactionRegex(text);
   if (regexResult) {
     console.log('[ledgerEngine] Tier-1 Regex extracted transaction:', regexResult);
@@ -316,9 +356,19 @@ export async function recordLedgerFromNote(
     if (!extracted) return null;
 
     db.execute(
-      `INSERT INTO ledger (note_id, person, original_name, direction, amount, currency) 
-       VALUES (?, ?, ?, ?, ?, ?)`,
-      [noteId, extracted.person, extracted.original_name, extracted.direction, extracted.amount, extracted.currency]
+      `INSERT INTO ledger (note_id, person, original_name, direction, amount, currency, category, status, raw_json) 
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        noteId,
+        extracted.person,
+        extracted.original_name,
+        extracted.direction,
+        extracted.amount,
+        extracted.currency || 'INR',
+        extracted.category || 'general',
+        extracted.status || 'unsettled',
+        extracted.raw_json || JSON.stringify(extracted),
+      ]
     );
 
     console.log(`[ledgerEngine] Saved ledger entry for note ${noteId}: ${extracted.direction} ₹${extracted.amount} (${extracted.person})`);

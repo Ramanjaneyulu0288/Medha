@@ -20,7 +20,7 @@ import { useColorScheme } from '@/hooks/use-color-scheme';
 import { brainStore } from '@/utils/BrainStore';
 import { getInsertId, readRows } from '@/utils/db';
 import { embedText } from '@/utils/embeddings';
-import { recordLedgerFromNote, syncLedgerFromNotes } from '@/utils/ledgerEngine';
+import { recordLedgerFromNote, syncLedgerFromNotes, extractTransactionRegex } from '@/utils/ledgerEngine';
 
 interface Note {
   id: number;
@@ -46,8 +46,13 @@ export default function NotesScreen() {
   // Load notes after tab transitions complete (never block tab animation)
   useFocusEffect(
     useCallback(() => {
-      const task = InteractionManager.runAfterInteractions(() => {
+      const task = InteractionManager.runAfterInteractions(async () => {
         loadNotes();
+        // Silent background check to backfill any pending ledger rows
+        if (brainStore.db) {
+          const synced = await syncLedgerFromNotes(brainStore.db, null);
+          if (synced > 0) loadNotes();
+        }
       });
       return () => task.cancel();
     }, [])
@@ -104,8 +109,26 @@ export default function NotesScreen() {
         [f32Array.buffer]
       );
 
-      // 4. Extract and record financial transaction (if present)
-      await recordLedgerFromNote(brainStore.db, Number(lastId), text, null);
+      // 4. Instant Tier 1 Regex extraction (0ms)
+      const instantTx = extractTransactionRegex(text);
+      if (instantTx) {
+        await recordLedgerFromNote(brainStore.db, Number(lastId), text, null);
+      } else if (brainStore.chatContext && !brainStore.isGenerating) {
+        // 5. Tier 2: Non-blocking Parallel Background LLM Worker
+        const savedNoteId = Number(lastId);
+        setTimeout(async () => {
+          try {
+            console.log(`[Notes Background LLM] Analyzing note ${savedNoteId}: "${text}"`);
+            const llmTx = await recordLedgerFromNote(brainStore.db, savedNoteId, text, brainStore.chatContext);
+            if (llmTx) {
+              console.log(`[Notes Background LLM] Extracted transaction:`, llmTx);
+              loadNotes();
+            }
+          } catch (e) {
+            console.warn('[Notes Background LLM] Error in background extraction:', e);
+          }
+        }, 100);
+      }
 
       setInputText('');
       loadNotes();
@@ -142,9 +165,12 @@ export default function NotesScreen() {
         }
       }
 
-      // 2. Sync missing financial transactions into ledger
-      const syncedTxCount = await syncLedgerFromNotes(brainStore.db);
+      // 2. Sync missing financial transactions into ledger with the LLM!
+      const syncedTxCount = await syncLedgerFromNotes(brainStore.db, brainStore.chatContext, (curr, tot) => {
+        setSyncProgress({ current: curr, total: tot });
+      });
 
+      loadNotes();
       Alert.alert(
         'Brain Sync Complete',
         `Indexed ${missing.length} missing vectors and synced ${syncedTxCount} financial ledger entries!`
@@ -326,35 +352,40 @@ export default function NotesScreen() {
                   })}
                 </Text>
                 <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
-                  {item.ledger_person && item.amount ? (
-                    <View
-                      style={[
-                        styles.chip,
-                        {
-                          backgroundColor:
-                            item.direction === 'GAVE' ? theme.accent + '20' : theme.success + '20',
-                          borderColor:
-                            item.direction === 'GAVE' ? theme.accent : theme.success,
-                          borderWidth: StyleSheet.hairlineWidth,
-                        },
-                      ]}
-                    >
-                      <Text
+                  {item.ledger_person && item.amount ? (() => {
+                    const isOwe = /\bowe\b/i.test(item.content);
+                    const isGave = item.direction === 'GAVE';
+                    const badgeColor = isGave ? theme.accent : isOwe ? theme.error : theme.success;
+                    const label = isGave
+                      ? `💳 Lent ₹${item.amount} to ${item.ledger_person}`
+                      : isOwe
+                        ? `💳 Owe ₹${item.amount} to ${item.ledger_person}`
+                        : `💳 Received ₹${item.amount} from ${item.ledger_person}`;
+                    return (
+                      <View
                         style={[
-                          styles.chipText,
+                          styles.chip,
                           {
-                            color:
-                              item.direction === 'GAVE' ? theme.accent : theme.success,
-                            fontWeight: '600',
+                            backgroundColor: badgeColor + '20',
+                            borderColor: badgeColor,
+                            borderWidth: StyleSheet.hairlineWidth,
                           },
                         ]}
                       >
-                        {item.direction === 'GAVE'
-                          ? `💳 Lent ₹${item.amount} to ${item.ledger_person}`
-                          : `💳 Received ₹${item.amount} from ${item.ledger_person}`}
-                      </Text>
-                    </View>
-                  ) : null}
+                        <Text
+                          style={[
+                            styles.chipText,
+                            {
+                              color: badgeColor,
+                              fontWeight: '700',
+                            },
+                          ]}
+                        >
+                          {label}
+                        </Text>
+                      </View>
+                    );
+                  })() : null}
                   <View style={[styles.chip, { backgroundColor: theme.accent + '15' }]}>
                     <Text style={[styles.chipText, { color: theme.accent }]}>768d Vector</Text>
                   </View>

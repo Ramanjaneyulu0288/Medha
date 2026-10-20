@@ -25,10 +25,14 @@ const INTENT_PATTERNS: { intent: RouteIntent; patterns: RegExp[] }[] = [
       /(?:did|has)\s+([a-zA-Z]+(?:\s+[a-zA-Z]+)?)\s+(?:pay|repay|settle|clear)/i,
       /owe\s+([a-zA-Z]+(?:\s+[a-zA-Z]+)?)/i,
       /who\s+owes\s+me/i,
+      /(?:how much|what|any)\s+(?:total\s+)?debt/i,
+      /(?:am i in|check my|show my|list my|what are my)\s+debts?/i,
       /(?:what are|check|show|list)\s+(?:my\s+)?debts/i,
+      /\b(?:my\s+)?debts?\b/i,
       /(?:balance|ledger|status)\s+(?:with|for)\s+([a-zA-Z]+(?:\s+[a-zA-Z]+)?)/i,
       /(?:settle|settled|cleared)\s+with\s+([a-zA-Z]+(?:\s+[a-zA-Z]+)?)/i,
-      /(?:do i owe|does anyone owe|who do i owe)/i,
+      /(?:do i owe|does anyone owe|who do i owe|how much do i owe)/i,
+      /(?:total\s+)?(?:balance|dues|liabilities|receivables)/i,
     ]
   },
   {
